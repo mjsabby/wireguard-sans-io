@@ -1,0 +1,23 @@
+# AVX2 is a hard requirement of `wireguard-chacha-simd` on x86_64
+# (enforced by `compile_error!`). Setting it here means plain
+# `cargo build`/`test`/`bench` Just Works without RUSTFLAGS, and the
+# `#[target_feature(enable = "avx2")]` kernels are inlinable into
+# their callers.
+#
+# `x86-64-v3` = Haswell (2013) baseline: AVX2 + BMI1/2 + FMA + MOVBE.
+# Override with `RUSTFLAGS="-C target-cpu=native"` for the host's
+# full feature set.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# aarch64: NEON is in the baseline; nothing to add.

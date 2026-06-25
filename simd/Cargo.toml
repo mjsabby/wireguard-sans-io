@@ -1,0 +1,30 @@
+[package]
+name = "wireguard-chacha-simd"
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mjsabby/wireguard-sans-io"
+description = "Pluggable ChaCha20 keystream backends (scalar / AVX2 4-way / NEON 4-way) for wireguard-sans-io. This crate alone in the workspace permits `unsafe` — every intrinsic call is bounded by the trait's fixed-size array signature and validated against the RFC vectors and the safe scalar reference."
+
+[lib]
+# No doctests in this crate; disabling avoids a separate doctest
+# compilation that (on some cargo versions) doesn't inherit
+# `[target.*] rustflags` and would trip the AVX2 `compile_error!`.
+doctest = false
+
+[dependencies]
+wireguard-sans-io = { path = "..", version = "1.0.0" }
+
+[dev-dependencies]
+
+# This is the ONLY crate in the workspace that permits unsafe. The scope
+# is exactly the core::arch SIMD intrinsics in avx2.rs / neon.rs; lib.rs
+# (the trait, dispatch, and scalar backend) is `#![deny(unsafe_code)]`
+# at module level.
+[lints.rust]
+unsafe_code = "warn"
+missing_docs = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "warn"

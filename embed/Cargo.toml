@@ -1,0 +1,45 @@
+[package]
+name = "wireguard-embed"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mjsabby/wireguard-sans-io"
+description = "std + alloc driver for wireguard-sans-io: BoringTun-style API (built-in clock, OS RNG, rate limiter, packet queue) wrapping the no_std core"
+keywords = ["wireguard", "noise", "vpn"]
+
+[features]
+default = []
+# Async driver: tokio UdpSocket + select! event loop. Buffers come from
+# the same SlabPool, so the sync and async paths share allocation
+# behaviour. tokio uses readiness-based I/O (epoll/kqueue/IOCP), so
+# buffers don't need kernel registration — but SlabPool gives them
+# stable Box-backed addresses anyway, which is what tokio-uring /
+# Windows RIO would need when you want true zero-copy later.
+async = ["dep:tokio"]
+
+[dependencies]
+wireguard-sans-io = { path = "..", version = "1.0.0" }
+# SIMD ChaCha20 backends (the workspace's only `unsafe`). `Best` falls
+# back to scalar at runtime, so this never narrows portability.
+wireguard-chacha-simd = { path = "../simd", version = "1.0.0" }
+# OS entropy. Tiny, no transitive deps beyond cfg-if.
+getrandom = "0.2"
+# Async driver (feature-gated). `net` for UdpSocket, `time` for
+# sleep_until(next_wake), `sync` for the TUN-side mpsc channels,
+# `macros` for select!, `rt` so the doctest/example can spawn.
+tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "sync", "macros", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "time", "sync", "macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"

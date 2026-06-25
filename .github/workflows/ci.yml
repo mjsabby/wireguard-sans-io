@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+# Only first-party `actions/*` actions are used. The Rust toolchain is set up
+# with plain `run:` steps via `rustup` (pre-installed on the GitHub-hosted
+# runners) rather than a third-party toolchain action — minimal profile, plus
+# the components/targets each job needs.
+
+jobs:
+  test:
+    name: Test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - run: cargo test --all-targets
+      - run: cargo test --doc
+
+  lint:
+    name: Clippy wall + rustfmt + docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + clippy, rustfmt)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup component add clippy rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+  no-panic:
+    name: Panic-freedom object scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - run: scripts/check_no_panic.sh
+
+  no-std:
+    name: Core-only target build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + uefi target)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add x86_64-unknown-uefi
+      - run: cargo build --lib --target x86_64-unknown-uefi
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (1.85)
+        run: |
+          rustup toolchain install 1.85 --profile minimal --no-self-update
+          rustup default 1.85
+      - run: cargo test --lib
+
+  coverage:
+    name: Coverage report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + llvm-tools)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup component add llvm-tools
+      - run: scripts/coverage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: target/coverage/coverage.txt
+
+  fuzz-smoke:
+    name: Fuzz smoke (10s/target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (nightly)
+        run: |
+          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup default nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: scripts/fuzz_all.sh 10
+
+  bench-smoke:
+    name: Bench smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - run: cargo run --release --example perf -- --quick

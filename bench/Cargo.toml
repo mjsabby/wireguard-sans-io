@@ -1,0 +1,40 @@
+[package]
+name = "wireguard-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Comparative micro-benchmarks: wireguard-embed vs BoringTun (in-process), plus a UDP loopback harness usable against wireguard-go / kernel."
+
+# This crate is its own workspace root (excluded from the parent) because
+# it has a path dependency on a sibling `../../boringtun` checkout that
+# may not exist on CI. Run with `cargo bench` from this directory.
+[workspace]
+members = ["."]
+
+[dependencies]
+wireguard-embed = { path = "../embed" }
+wireguard-sans-io = { path = ".." }
+wireguard-chacha-simd = { path = "../simd" }
+boringtun = { path = "../../boringtun/boringtun", default-features = false }
+# x25519-dalek is a transitive dep of boringtun; we need its types to
+# construct boringtun::Tunn.
+x25519-dalek = { version = "2.0.1", features = ["reusable_secrets", "static_secrets"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+# ring directly, for the ChaCha20 keystream reference line in the
+# `chacha` benchmark (BoringTun doesn't re-export it).
+ring = "0.17"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "compare"
+harness = false
+
+[[bench]]
+name = "chacha"
+harness = false
+
+[[bin]]
+name = "udp_throughput"
+path = "src/udp_throughput.rs"
