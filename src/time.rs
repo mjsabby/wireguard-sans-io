@@ -1,9 +1,16 @@
 //! Caller-supplied time, sans-I/O style.
 //!
-//! The library never reads a clock. Every API call that can depend on time
-//! takes a [`Now`], which carries both a monotonic instant ([`Ticks`], used
-//! for all whitepaper §6 timers) and a wall-clock reading (used only to
-//! build the TAI64N handshake timestamp, [`Tai64N`]).
+//! The library never reads a clock. Every API call that depends on time
+//! takes one monotonic instant, [`Ticks`], which drives every whitepaper §6
+//! timer.
+//!
+//! The only use WireGuard has for the wall clock is the TAI64N timestamp
+//! inside a handshake initiation ([`Tai64N`]), and all the protocol needs
+//! from it is that it keeps increasing. So the wall clock is read **once**,
+//! as a [`WallClock`] anchor ("at monotonic instant X the Unix clock said
+//! Y"), and every later timestamp is derived from the monotonic clock. A
+//! wall-clock step during a run therefore cannot make timestamps go
+//! backwards.
 
 use core::fmt;
 
@@ -11,15 +18,29 @@ use core::fmt;
 /// epoch (e.g. `std::time::Instant` elapsed-since-start).
 ///
 /// `Ticks` must never decrease across calls into the same
-/// [`crate::Tunnel`]. All arithmetic is saturating, so even a hostile clock
-/// cannot cause a panic — a decreasing clock merely degrades timer
-/// behaviour.
+/// [`crate::Tunnel`], and must stay below [`Ticks::MAX`]. All arithmetic is
+/// saturating, so even a hostile clock cannot cause a panic — an instant
+/// that is earlier than the last one, or out of range, merely stops time
+/// for that call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub struct Ticks(u64);
 
 impl Ticks {
     /// The zero instant.
     pub const ZERO: Self = Self(0);
+
+    /// The latest instant the library takes for a time: 2⁶³ − 1 ns, some
+    /// 292 years after the caller's epoch.
+    ///
+    /// No monotonic clock that counts from boot or from process start gets
+    /// there. An instant beyond it is a unit mix-up
+    /// (`Ticks::from_secs(milliseconds)` saturates) or a value that was
+    /// never set, and a [`crate::Tunnel`] or [`crate::Device`] given one
+    /// treats it as it treats a clock that goes backwards: for that call,
+    /// no time has passed. Taken at face value it would make every
+    /// deadline due at once and for ever — sessions wiped, and something
+    /// to send on every `poll`.
+    pub const MAX: Self = Self(u64::MAX >> 1);
 
     /// Construct from nanoseconds since the caller's epoch.
     #[must_use]
@@ -54,49 +75,89 @@ impl Ticks {
 
     /// The earlier of two instants.
     #[must_use]
-    pub fn min(self, other: Self) -> Self {
+    pub const fn min(self, other: Self) -> Self {
         if self.0 <= other.0 { self } else { other }
+    }
+
+    /// The later of two instants.
+    #[must_use]
+    pub const fn max(self, other: Self) -> Self {
+        if self.0 >= other.0 { self } else { other }
+    }
+
+    /// What a caller's `now` counts as, given the latest instant seen so
+    /// far: itself, unless it is earlier than that or beyond
+    /// [`Ticks::MAX`] — then time has not moved.
+    #[must_use]
+    pub(crate) const fn following(self, latest: Self) -> Self {
+        if self.0 < latest.0 || self.0 > Self::MAX.0 {
+            latest
+        } else {
+            self
+        }
     }
 }
 
-/// A complete caller-supplied reading of "now".
+/// One nanosecond-resolution second.
+const NANOS_PER_SEC: u64 = 1_000_000_000;
+
+/// A wall-clock anchor: "at monotonic instant [`Ticks`] `at`, the Unix
+/// clock read `unix_secs`.`unix_nanos`".
+///
+/// Read the wall clock once, when the [`crate::Device`] is created, and
+/// hand it over in this form. Handshake timestamps are then computed as
+/// `anchor + (now − at)` from the monotonic clock alone.
+///
+/// A platform that boots without a real-time clock can re-anchor after it
+/// learns the time ([`crate::Device::set_wall_clock`],
+/// [`crate::Tunnel::set_wall_clock`]); outbound timestamps are ratcheted, so
+/// re-anchoring to an earlier time never makes them decrease within a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Now {
-    /// Monotonic time, drives every protocol timer.
-    pub ticks: Ticks,
-    /// Wall-clock seconds since the Unix epoch. Only used to build the
-    /// TAI64N timestamp inside handshake initiations; it must be (roughly)
-    /// real **and non-decreasing**: the library clamps `ticks` against
-    /// regression but cannot clamp the wall clock, so a backwards step
-    /// here makes the peer reject our initiations as
-    /// [`crate::Error::ReplayedTimestamp`] until the clock catches up.
-    pub unix_secs: u64,
-    /// Sub-second nanoseconds of the wall clock, `< 1_000_000_000`
-    /// (defensively clamped, never panics).
-    pub unix_nanos: u32,
+pub struct WallClock {
+    at: Ticks,
+    unix_secs: u64,
+    unix_nanos: u32,
 }
 
-impl Now {
-    /// Build a `Now` from monotonic nanoseconds and a Unix wall-clock
-    /// reading. `unix_nanos` is clamped to `999_999_999`.
+impl WallClock {
+    /// Anchor the wall clock: at monotonic instant `at` the Unix clock read
+    /// `unix_secs` seconds and `unix_nanos` nanoseconds. `unix_nanos` is
+    /// clamped to `999_999_999`.
     #[must_use]
-    pub const fn new(mono_nanos: u64, unix_secs: u64, unix_nanos: u32) -> Self {
+    pub const fn new(at: Ticks, unix_secs: u64, unix_nanos: u32) -> Self {
         let unix_nanos = if unix_nanos > 999_999_999 {
             999_999_999
         } else {
             unix_nanos
         };
         Self {
-            ticks: Ticks::from_nanos(mono_nanos),
+            at,
             unix_secs,
             unix_nanos,
         }
     }
 
-    /// The TAI64N timestamp for this wall-clock reading.
+    /// The Unix time `(seconds, nanoseconds)` this anchor implies for the
+    /// monotonic instant `now`. Instants before the anchor read as the
+    /// anchor itself; everything saturates.
     #[must_use]
-    pub const fn tai64n(&self) -> Tai64N {
-        Tai64N::from_unix(self.unix_secs, self.unix_nanos)
+    pub const fn unix_at(&self, now: Ticks) -> (u64, u32) {
+        let elapsed = now.since(self.at);
+        let nanos = (self.unix_nanos as u64).saturating_add(elapsed % NANOS_PER_SEC);
+        let carry = nanos / NANOS_PER_SEC;
+        let secs = self
+            .unix_secs
+            .saturating_add(elapsed / NANOS_PER_SEC)
+            .saturating_add(carry);
+        // `nanos % NANOS_PER_SEC` is below 10^9 and so fits a `u32`.
+        (secs, (nanos % NANOS_PER_SEC) as u32)
+    }
+
+    /// The TAI64N timestamp for the monotonic instant `now`.
+    #[must_use]
+    pub const fn tai64n(&self, now: Ticks) -> Tai64N {
+        let (secs, nanos) = self.unix_at(now);
+        Tai64N::from_unix(secs, nanos)
     }
 }
 
@@ -144,9 +205,9 @@ impl Tai64N {
 
     /// The smallest TAI64N strictly greater than `self` (96-bit big-endian
     /// increment, saturating at all-ones). Used to ratchet outbound
-    /// initiation timestamps so a frozen caller wall clock cannot make the
-    /// peer reject every retransmission as
-    /// [`crate::Error::ReplayedTimestamp`]. The increment lands in the
+    /// initiation timestamps so that the peer never sees one repeat or go
+    /// backwards — which it would reject as
+    /// [`crate::DropReason::ReplayedTimestamp`]. The increment lands in the
     /// low (whitened-away) nanosecond bits, so it leaks nothing the
     /// previous timestamp did not.
     #[must_use]
@@ -223,8 +284,44 @@ mod tests {
     #[test]
     fn tai64n_never_panics_on_extreme_inputs() {
         let _ = Tai64N::from_unix(u64::MAX, u32::MAX);
-        let _ = Now::new(u64::MAX, u64::MAX, u32::MAX);
-        assert_eq!(Now::new(0, 0, u32::MAX).unix_nanos, 999_999_999);
+        let w = WallClock::new(Ticks::from_nanos(u64::MAX), u64::MAX, u32::MAX);
+        let _ = w.tai64n(Ticks::from_nanos(u64::MAX));
+        let _ = w.tai64n(Ticks::ZERO);
+        assert_eq!(
+            WallClock::new(Ticks::ZERO, 0, u32::MAX).unix_at(Ticks::ZERO),
+            (0, 999_999_999)
+        );
+    }
+
+    #[test]
+    fn wall_clock_follows_the_monotonic_clock() {
+        let w = WallClock::new(Ticks::from_secs(10), 1_700_000_000, 900_000_000);
+        // At the anchor.
+        assert_eq!(
+            w.unix_at(Ticks::from_secs(10)),
+            (1_700_000_000, 900_000_000)
+        );
+        // Before the anchor: reads as the anchor (never earlier).
+        assert_eq!(w.unix_at(Ticks::ZERO), (1_700_000_000, 900_000_000));
+        // Sub-second carry into the seconds field.
+        assert_eq!(
+            w.unix_at(Ticks::from_nanos(10 * 1_000_000_000 + 200_000_000)),
+            (1_700_000_001, 100_000_000)
+        );
+        // Whole seconds.
+        assert_eq!(
+            w.unix_at(Ticks::from_secs(70)),
+            (1_700_000_060, 900_000_000)
+        );
+        // Timestamps are non-decreasing in `now`.
+        let mut last = w.tai64n(Ticks::ZERO);
+        for step in 0..2_000u64 {
+            let t = w.tai64n(Ticks::from_nanos(step * 7_919_000));
+            assert!(t >= last, "timestamp went backwards at step {step}");
+            last = t;
+        }
+        // And strictly increasing across whole seconds.
+        assert!(w.tai64n(Ticks::from_secs(12)) > w.tai64n(Ticks::from_secs(11)));
     }
 
     #[test]

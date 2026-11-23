@@ -8,69 +8,218 @@
 //!   cookie minted from a rotating secret and the sender's endpoint, and
 //!   delivered encrypted (XChaCha20-Poly1305) bound to the provoking
 //!   message's `mac1`.
+//!
+//! The state splits along who the keys belong to:
+//!
+//! * everything keyed by **our own** public key — verifying `mac1`,
+//!   minting cookies, sealing cookie replies — is the same for every peer
+//!   and lives once, in the [`crate::Device`] ([`DeviceMacKeys`],
+//!   [`CookieJar`]);
+//! * everything keyed by **the peer's** public key — computing the `mac1`
+//!   and `mac2` we send, opening cookie replies we receive — lives in that
+//!   peer's [`crate::Tunnel`] ([`PeerMacKeys`], [`LastCookie`]).
+
+use core::net::{IpAddr, SocketAddr};
 
 use crate::Error;
-use crate::consts::{COOKIE_LIFETIME, COOKIE_REPLY_LEN, LABEL_COOKIE, LABEL_MAC1};
-use crate::crypto::{aead, blake2s, ct};
+use crate::consts::{
+    COOKIE_LIFETIME, COOKIE_REPLY_LEN, COOKIE_SECRET_GRACE, LABEL_COOKIE, LABEL_MAC1,
+};
+use crate::crypto::{CryptoProvider, ct, siphash};
 use crate::entropy::EntropySource;
 use crate::keys::PublicKey;
 use crate::message::{self, CookieReply};
-use crate::time::{Now, Ticks};
+use crate::time::Ticks;
 
-/// Per-peer precomputed MAC and cookie-encryption keys (whitepaper
-/// §5.4.4/§5.4.7 note that these hashes "can be pre-computed").
+/// MAC and cookie keys derived from **our own** static public key
+/// (whitepaper §5.4.4/§5.4.7 note that these hashes "can be pre-computed").
+/// Shared by every peer of a device.
 #[derive(Clone)]
-pub(crate) struct MacKeys {
-    /// `Hash(Label-Mac1 ∥ peer_public)`: keys `mac1` on messages we send.
-    pub mac1_send: [u8; 32],
+pub(crate) struct DeviceMacKeys {
     /// `Hash(Label-Mac1 ∥ our_public)`: verifies `mac1` on messages we
     /// receive.
-    pub mac1_recv: [u8; 32],
+    mac1_recv: [u8; 32],
+    /// What the provider made of that key for repeated use
+    /// ([`CryptoProvider::mac_prepare`]): every handshake message that
+    /// arrives, genuine or not, is checked with it first.
+    mac1_recv_state: [u32; 8],
     /// `Hash(Label-Cookie ∥ our_public)`: encrypts cookie replies we send.
-    pub cookie_send: [u8; 32],
-    /// `Hash(Label-Cookie ∥ peer_public)`: decrypts cookie replies we
-    /// receive.
-    pub cookie_recv: [u8; 32],
+    cookie_send: [u8; 32],
 }
 
-impl MacKeys {
-    pub(crate) fn new(local_public: &PublicKey, peer_public: &PublicKey) -> Self {
+/// `Hash(label ∥ public)`: the MAC and cookie keys are derived from public
+/// keys, so — unlike everything in [`crate::noise`] — they are not secret.
+fn label_hash<P: CryptoProvider>(label: &[u8], public: &PublicKey) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    P::hash(&[label, public.as_bytes()], &mut out);
+    out
+}
+
+impl DeviceMacKeys {
+    /// Not derived yet.
+    pub(crate) const BLANK: Self = Self {
+        mac1_recv: [0u8; 32],
+        mac1_recv_state: [0u32; 8],
+        cookie_send: [0u8; 32],
+    };
+
+    pub(crate) fn new<P: CryptoProvider>(local_public: &PublicKey) -> Self {
+        let mac1_recv = label_hash::<P>(LABEL_MAC1, local_public);
+        let mut mac1_recv_state = [0u32; 8];
+        P::mac_prepare(&mac1_recv, &mut mac1_recv_state);
         Self {
-            mac1_send: blake2s::hash(&[LABEL_MAC1, peer_public.as_bytes()]),
-            mac1_recv: blake2s::hash(&[LABEL_MAC1, local_public.as_bytes()]),
-            cookie_send: blake2s::hash(&[LABEL_COOKIE, local_public.as_bytes()]),
-            cookie_recv: blake2s::hash(&[LABEL_COOKIE, peer_public.as_bytes()]),
+            mac1_recv,
+            mac1_recv_state,
+            cookie_send: label_hash::<P>(LABEL_COOKIE, local_public),
         }
     }
 }
 
-impl core::fmt::Debug for MacKeys {
+impl core::fmt::Debug for DeviceMacKeys {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("MacKeys")
+        f.write_str("DeviceMacKeys")
+    }
+}
+
+/// MAC and cookie keys derived from **the peer's** static public key.
+#[derive(Clone)]
+pub(crate) struct PeerMacKeys {
+    /// `Hash(Label-Mac1 ∥ peer_public)`: keys `mac1` on messages we send.
+    mac1_send: [u8; 32],
+    /// What the provider made of that key for repeated use
+    /// ([`CryptoProvider::mac_prepare`]).
+    mac1_send_state: [u32; 8],
+    /// `Hash(Label-Cookie ∥ peer_public)`: decrypts cookie replies we
+    /// receive.
+    cookie_recv: [u8; 32],
+}
+
+impl PeerMacKeys {
+    /// Not derived yet.
+    pub(crate) const BLANK: Self = Self {
+        mac1_send: [0u8; 32],
+        mac1_send_state: [0u32; 8],
+        cookie_recv: [0u8; 32],
+    };
+
+    pub(crate) fn new<P: CryptoProvider>(peer_public: &PublicKey) -> Self {
+        let mac1_send = label_hash::<P>(LABEL_MAC1, peer_public);
+        let mut mac1_send_state = [0u32; 8];
+        P::mac_prepare(&mac1_send, &mut mac1_send_state);
+        Self {
+            mac1_send,
+            mac1_send_state,
+            cookie_recv: label_hash::<P>(LABEL_COOKIE, peer_public),
+        }
+    }
+}
+
+impl core::fmt::Debug for PeerMacKeys {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PeerMacKeys")
+    }
+}
+
+/// The canonical byte encoding of a source address that cookies are bound
+/// to (whitepaper §5.4.7, `A_remote`): the IP address followed by the port
+/// in network byte order — 6 bytes for IPv4, 18 for IPv6.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a dual-stack socket
+/// reports for an IPv4 sender) encodes exactly like the IPv4 address it
+/// maps, so the same host gets the same cookie whichever way the socket
+/// names it.
+#[derive(Clone, Copy)]
+pub(crate) struct RemoteBytes {
+    bytes: [u8; 18],
+    len: usize,
+}
+
+impl RemoteBytes {
+    pub(crate) fn new(addr: SocketAddr) -> Self {
+        let mut bytes = [0u8; 18];
+        let v4 = match addr.ip() {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        };
+        let ip_len = match (v4, addr.ip()) {
+            (Some(v4), _) => {
+                for (d, s) in bytes.iter_mut().zip(v4.octets().iter()) {
+                    *d = *s;
+                }
+                4usize
+            }
+            (None, IpAddr::V6(v6)) => {
+                for (d, s) in bytes.iter_mut().zip(v6.octets().iter()) {
+                    *d = *s;
+                }
+                16usize
+            }
+            // Unreachable: a V4 address always yields `Some` above.
+            (None, IpAddr::V4(_)) => 0usize,
+        };
+        for (d, s) in bytes
+            .iter_mut()
+            .skip(ip_len)
+            .zip(addr.port().to_be_bytes().iter())
+        {
+            *d = *s;
+        }
+        Self {
+            bytes,
+            len: ip_len.saturating_add(2),
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or(&[])
     }
 }
 
 /// The most recent cookie a peer sent us (initiator side of the cookie
 /// dance). Used to fill `mac2` while fresh (`< COOKIE_LIFETIME`).
-#[derive(Clone)]
+///
+/// One place for the cookie, inside the tunnel: it is written there by
+/// reference and wiped there.
 pub(crate) struct LastCookie {
     value: [u8; 16],
-    received_at: Ticks,
+    received_at: Option<Ticks>,
 }
 
 impl LastCookie {
-    pub(crate) fn new(value: [u8; 16], received_at: Ticks) -> Self {
-        Self { value, received_at }
+    /// No cookie.
+    pub(crate) const fn none() -> Self {
+        Self {
+            value: [0; 16],
+            received_at: None,
+        }
+    }
+
+    /// Keep `value`, received at `now`.
+    pub(crate) fn store(&mut self, value: &[u8; 16], now: Ticks) {
+        ct::copy_secret(&mut self.value, value);
+        self.received_at = Some(now);
+    }
+
+    /// Forget the cookie, wiping it where it lies.
+    pub(crate) fn clear(&mut self) {
+        ct::wipe_array(&mut self.value);
+        self.received_at = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_some(&self) -> bool {
+        self.received_at.is_some()
     }
 
     pub(crate) fn fresh_value(&self, now: Ticks) -> Option<&[u8; 16]> {
-        (now.since(self.received_at) < COOKIE_LIFETIME).then_some(&self.value)
+        let received_at = self.received_at?;
+        (now.since(received_at) < COOKIE_LIFETIME).then_some(&self.value)
     }
 }
 
 impl Drop for LastCookie {
     fn drop(&mut self) {
-        ct::wipe_array(&mut self.value);
+        self.clear();
     }
 }
 
@@ -81,23 +230,41 @@ impl core::fmt::Debug for LastCookie {
 }
 
 /// The responder's rotating cookie secret (`R_m`, whitepaper §5.4.7): a
-/// random value that changes every two minutes. The previous secret is
-/// kept so cookies minted just before a rotation stay verifiable for their
-/// full advertised lifetime.
+/// random value that changes every two minutes.
+///
+/// A secret mints cookies for one [`COOKIE_LIFETIME`] and is honoured for
+/// [`COOKIE_SECRET_GRACE`] more — whether or not anything has been minted
+/// since (rotation itself happens when the next cookie is minted, because
+/// that is where the entropy source is at hand). The secret before the
+/// current one is kept for that: a cookie handed out just before a
+/// rotation is still good for the retransmission it was asked for.
+///
+/// A cookie proves that its holder received something at the address it
+/// names, some time while its secret was in use. It does not prove that a
+/// particular message is recent: `mac2` covers a message, not when it was
+/// sent, so a recording of a message with a valid `mac2` passes this check
+/// until the secret behind it is no longer honoured.
 pub(crate) struct CookieJar {
     secret: [u8; 32],
     previous: [u8; 32],
     /// `previous` holds a real (random) secret. False until the *second*
     /// rotation, so the all-zero pre-prime value is never accepted.
     has_previous: bool,
+    /// When `secret` was drawn.
     rotated_at: Ticks,
+    /// When `previous` was drawn.
+    previous_rotated_at: Ticks,
     primed: bool,
-    /// 192-bit counter for XChaCha20 cookie-reply nonces. The XChaCha
-    /// nonce needs only uniqueness under `cookie_send`, not
-    /// unpredictability, so a counter avoids drawing 24 bytes of entropy
-    /// per reply (which under flood becomes the dominant cost and can
-    /// stall a constrained HWRNG).
-    nonce_counter: [u64; 3],
+    /// Cookie-reply nonces. XChaCha20 needs a nonce that does not repeat
+    /// under `cookie_send`, and drawing 24 bytes of entropy for every
+    /// reply would be the dominant cost under a flood (and can stall a
+    /// constrained HWRNG). A counter would do for uniqueness — but it
+    /// would be on the wire, telling anyone how many replies this device
+    /// has sent, which is how loaded it is. So a nonce is a pseudo-random
+    /// function of the counter, under a key drawn once when the jar is
+    /// first used: as good as a random nonce to everyone else, and free.
+    nonce_key: [u8; 16],
+    nonce_counter: u64,
 }
 
 impl CookieJar {
@@ -107,93 +274,145 @@ impl CookieJar {
             previous: [0u8; 32],
             has_previous: false,
             rotated_at: Ticks::ZERO,
+            previous_rotated_at: Ticks::ZERO,
             primed: false,
-            nonce_counter: [0u64; 3],
+            nonce_key: [0u8; 16],
+            nonce_counter: 0,
         }
     }
 
     fn rotate_if_needed(&mut self, now: Ticks, rng: &mut dyn EntropySource) -> Result<(), Error> {
-        if !self.primed || now.since(self.rotated_at) >= COOKIE_LIFETIME {
-            // Draw ALL required entropy before committing anything, so
-            // a failure leaves the jar untouched (and the next call
-            // retries the prime from scratch).
-            let fresh = rng.gen32().map_err(|_| Error::EntropyFailure)?;
-            let nonce_seed = if self.primed {
-                None
-            } else {
-                // First prime: seed the nonce counter so independent
-                // restarts under the same static key do not replay
-                // XChaCha20 nonces under the deterministic
-                // `cookie_send` key — nonce reuse there is Poly1305
-                // one-time-key reuse, i.e. cookie-reply forgery.
-                // Failing closed costs nothing the caller wouldn't
-                // lose anyway: the handshake response that follows
-                // needs entropy too.
-                let mut seed = [0u8; 24];
-                rng.fill(&mut seed).map_err(|_| Error::EntropyFailure)?;
-                Some(seed)
-            };
-            // Only after entropy succeeded: commit the rotation.
-            self.previous = self.secret;
-            self.has_previous = self.primed; // true from the second rotation on
-            self.secret = fresh;
-            self.rotated_at = now;
-            if let Some(seed) = nonce_seed {
-                let (a, rest) = seed.split_first_chunk::<8>().unwrap_or((&[0; 8], &[]));
-                let (b, rest) = rest.split_first_chunk::<8>().unwrap_or((&[0; 8], &[]));
-                let (c, _) = rest.split_first_chunk::<8>().unwrap_or((&[0; 8], &[]));
-                self.nonce_counter = [
-                    u64::from_le_bytes(*a),
-                    u64::from_le_bytes(*b),
-                    u64::from_le_bytes(*c),
-                ];
-            }
-            self.primed = true;
+        if self.primed && now.since(self.rotated_at) < COOKIE_LIFETIME {
+            return Ok(());
         }
+        // The new secret is drawn straight into the place of the previous
+        // one, and the two then change places: neither is ever anywhere
+        // but in the jar. The previous secret can be written over because
+        // it is past being honoured — it was drawn a lifetime or more
+        // before the current one, which is itself a lifetime old.
+        //
+        // All the entropy is drawn before anything is committed, so a
+        // failure leaves the current secret, and whether the jar is
+        // primed, as they were (the next call tries again from scratch).
+        self.has_previous = false;
+        let mut drawn = rng.fill(&mut self.previous);
+        if drawn.is_ok() && !self.primed {
+            // First prime: the key the nonces are derived with. A fixed
+            // one would make two runs under the same static key repeat
+            // their nonces under the deterministic `cookie_send` key
+            // (keystream and Poly1305 one-time-key reuse), and would make
+            // the counter readable again. Failing closed costs nothing the
+            // caller wouldn't lose anyway: the handshake response that
+            // follows needs entropy too.
+            drawn = rng.fill(&mut self.nonce_key);
+        }
+        if drawn.is_err() {
+            ct::wipe_array(&mut self.previous);
+            if !self.primed {
+                ct::wipe_array(&mut self.nonce_key);
+            }
+            return Err(Error::EntropyFailure);
+        }
+        ct::swap_secret(&mut self.secret, &mut self.previous);
+        self.previous_rotated_at = self.rotated_at;
+        self.has_previous = self.primed; // true from the second rotation on
+        self.rotated_at = now;
+        if !self.primed {
+            self.nonce_counter = 0;
+        }
+        self.primed = true;
         Ok(())
     }
 
-    /// Take the next unique 24-byte XChaCha20 nonce.
+    /// The next 24-byte XChaCha20 nonce: three SipHash-2-4 outputs over
+    /// the reply counter. (2⁶⁴ replies are out of reach; the counter
+    /// wrapping would repeat nonces.)
     fn next_nonce(&mut self) -> [u8; 24] {
-        // 192-bit increment: practically inexhaustible.
-        let [a, b, c] = self.nonce_counter;
-        let (a, carry) = a.overflowing_add(1);
-        let (b, carry) = b.overflowing_add(u64::from(carry));
-        let c = c.wrapping_add(u64::from(carry));
-        self.nonce_counter = [a, b, c];
+        self.nonce_counter = self.nonce_counter.wrapping_add(1);
+        let mut input = [0u8; 9];
+        if let Some(counter) = input.first_chunk_mut::<8>() {
+            *counter = self.nonce_counter.to_le_bytes();
+        }
+        // Three words, each of its own input: counter ∥ 0, 1, 2.
+        let mut words = [0u64; 3];
+        for (part, word) in (0u8..).zip(words.iter_mut()) {
+            if let Some(last) = input.last_mut() {
+                *last = part;
+            }
+            *word = siphash::siphash24(&self.nonce_key, &input);
+        }
+        let [w0, w1, w2] = words.map(u64::to_le_bytes);
         let mut out = [0u8; 24];
-        for (chunk, word) in out.chunks_exact_mut(8).zip(self.nonce_counter.iter()) {
-            chunk.copy_from_slice(&word.to_le_bytes());
+        for (o, b) in out.iter_mut().zip(w0.iter().chain(&w1).chain(&w2)) {
+            *o = *b;
         }
         out
     }
 
-    /// `τ := Mac(R_m, A_remote)`: the cookie for a remote endpoint.
-    /// `remote` is the caller-encoded source IP and port.
-    pub(crate) fn mint(
+    /// `τ := Mac(R_m, A_remote)`: the cookie for a remote endpoint,
+    /// written to `cookie`.
+    fn mint<P: CryptoProvider>(
         &mut self,
         now: Ticks,
         rng: &mut dyn EntropySource,
         remote: &[u8],
-    ) -> Result<[u8; 16], Error> {
+        cookie: &mut [u8; 16],
+    ) -> Result<(), Error> {
         self.rotate_if_needed(now, rng)?;
-        Ok(blake2s::mac(&self.secret, &[remote]))
+        P::mac(&self.secret, &[remote], cookie);
+        Ok(())
     }
 
-    /// Does `mac2` prove possession of a cookie we minted recently for
-    /// `remote`? Checks the current and (if real) previous secret, in
-    /// constant time.
-    pub(crate) fn verify_mac2(&self, remote: &[u8], beta: &[u8], mac2: &[u8; 16]) -> bool {
+    /// Does `mac2` prove possession of a cookie we minted for `remote`
+    /// from a secret that is still honoured? Constant time in the cookie
+    /// and in `mac2`.
+    ///
+    /// Which secrets are tried depends on the time alone: the current one
+    /// while it is honoured, and the one before it only in the short while
+    /// after a rotation in which it still is (and never the all-zero value
+    /// that stands in its place before the second rotation). Most of the
+    /// time that is one secret, three hash calls less than trying both.
+    pub(crate) fn verify_mac2<P: CryptoProvider>(
+        &self,
+        now: Ticks,
+        remote: &[u8],
+        beta: &[u8],
+        mac2: &[u8; 16],
+    ) -> bool {
         if !self.primed {
             return false;
         }
-        let current = blake2s::mac(&blake2s::mac(&self.secret, &[remote]), &[beta]);
-        let previous = blake2s::mac(&blake2s::mac(&self.previous, &[remote]), &[beta]);
-        // Both arms always evaluated; `has_previous` masks the
-        // pre-second-rotation all-zero secret so it is never accepted.
-        let ok_current = ct::ct_eq(&current, mac2);
-        let ok_previous = ct::ct_eq(&previous, mac2) & self.has_previous;
-        ok_current | ok_previous
+        let honoured = |drawn_at: Ticks| {
+            now.since(drawn_at) < COOKIE_LIFETIME.saturating_add(COOKIE_SECRET_GRACE)
+        };
+        let mut proven = false;
+        if honoured(self.rotated_at) {
+            proven |= Self::proves::<P>(&self.secret, remote, beta, mac2);
+        }
+        if self.has_previous && honoured(self.previous_rotated_at) {
+            proven |= Self::proves::<P>(&self.previous, remote, beta, mac2);
+        }
+        proven
+    }
+
+    /// Is `mac2` what the cookie that `secret` gives `remote` makes of
+    /// `beta`? The cookie and the `mac2` it leads to are wiped before
+    /// returning: a cookie is a credential, and the `mac2` we expect is
+    /// what a holder of the cookie would have to send.
+    fn proves<P: CryptoProvider>(
+        secret: &[u8; 32],
+        remote: &[u8],
+        beta: &[u8],
+        mac2: &[u8; 16],
+    ) -> bool {
+        let mut cookie = [0u8; 16];
+        let mut expected = [0u8; 16];
+        P::mac(secret, &[remote], &mut cookie);
+        P::mac(&cookie, &[beta], &mut expected);
+        let proven = ct::ct_eq(&expected, mac2);
+        ct::wipe_array(&mut cookie);
+        ct::wipe_array(&mut expected);
+        proven
     }
 }
 
@@ -201,6 +420,7 @@ impl Drop for CookieJar {
     fn drop(&mut self) {
         ct::wipe_array(&mut self.secret);
         ct::wipe_array(&mut self.previous);
+        ct::wipe_array(&mut self.nonce_key);
     }
 }
 
@@ -215,27 +435,42 @@ impl core::fmt::Debug for CookieJar {
 /// to authenticate a possible cookie reply.
 ///
 /// # Errors
-/// `InvalidPacket` if `msg` is not a handshake message (internal misuse).
-pub(crate) fn apply_macs(
-    keys: &MacKeys,
-    cookie: Option<&LastCookie>,
+/// `BufferTooSmall` if `msg` is not handshake-message sized (internal
+/// misuse).
+pub(crate) fn apply_macs<P: CryptoProvider>(
+    keys: &PeerMacKeys,
+    cookie: &LastCookie,
     now: Ticks,
     msg: &mut [u8],
 ) -> Result<[u8; 16], Error> {
     let slots = message::mac_slots(msg)?;
-    let mac1 = blake2s::mac(&keys.mac1_send, &[slots.alpha]);
-    *slots.mac1 = mac1;
+    P::mac_prepared(
+        &keys.mac1_send,
+        &keys.mac1_send_state,
+        &[slots.alpha],
+        slots.mac1,
+    );
     // msg.mac2 := Mac(L, msgβ) when the cookie is fresh, else 0^16.
-    *slots.mac2 = match cookie.and_then(|c| c.fresh_value(now)) {
-        Some(value) => blake2s::mac(value, &[slots.alpha, slots.mac1]),
-        None => [0u8; 16],
-    };
-    Ok(mac1)
+    match cookie.fresh_value(now) {
+        Some(value) => P::mac(value, &[slots.alpha, slots.mac1], slots.mac2),
+        None => *slots.mac2 = [0u8; 16],
+    }
+    Ok(*slots.mac1)
 }
 
 /// Verify `mac1` of a received handshake message, constant time.
-pub(crate) fn verify_mac1(keys: &MacKeys, alpha: &[u8], mac1: &[u8; 16]) -> bool {
-    let expected = blake2s::mac(&keys.mac1_recv, &[alpha]);
+pub(crate) fn verify_mac1<P: CryptoProvider>(
+    keys: &DeviceMacKeys,
+    alpha: &[u8],
+    mac1: &[u8; 16],
+) -> bool {
+    let mut expected = [0u8; 16];
+    P::mac_prepared(
+        &keys.mac1_recv,
+        &keys.mac1_recv_state,
+        &[alpha],
+        &mut expected,
+    );
     ct::ct_eq(&expected, mac1)
 }
 
@@ -245,8 +480,8 @@ pub(crate) fn verify_mac1(keys: &MacKeys, alpha: &[u8], mac1: &[u8; 16]) -> bool
 /// # Errors
 /// `BufferTooSmall`, `EntropyFailure`.
 #[allow(clippy::too_many_arguments)] // internal plumbing; every argument is distinct state
-pub(crate) fn build_cookie_reply(
-    keys: &MacKeys,
+pub(crate) fn build_cookie_reply<P: CryptoProvider>(
+    keys: &DeviceMacKeys,
     jar: &mut CookieJar,
     now: Ticks,
     rng: &mut dyn EntropySource,
@@ -258,18 +493,22 @@ pub(crate) fn build_cookie_reply(
     if out.len() < COOKIE_REPLY_LEN {
         return Err(Error::BufferTooSmall);
     }
-    let mut cookie = jar.mint(now, rng, remote)?;
-    let nonce = jar.next_nonce();
+    // The cookie is minted straight into the first half of the buffer it
+    // is then sealed in: the plaintext cookie exists in that one place,
+    // and only until the seal has turned it into ciphertext.
     let mut encrypted = [0u8; 32];
-    let sealed = aead::xseal(
-        &keys.cookie_send,
-        &nonce,
-        their_mac1,
-        &cookie,
-        &mut encrypted,
-    );
-    ct::wipe_array(&mut cookie);
+    let minted = match encrypted.first_chunk_mut::<16>() {
+        Some(cookie) => jar.mint::<P>(now, rng, remote, cookie),
+        None => Err(Error::Internal),
+    };
+    if let Err(e) = minted {
+        ct::wipe_array(&mut encrypted);
+        return Err(e);
+    }
+    let nonce = jar.next_nonce();
+    let sealed = P::xseal_in_place(&keys.cookie_send, &nonce, their_mac1, 16, &mut encrypted);
     if sealed != Ok(32) {
+        ct::wipe_array(&mut encrypted);
         return Err(Error::Internal);
     }
     message::build_cookie_reply(out, peer_sender_index, &nonce, &encrypted)?;
@@ -277,132 +516,28 @@ pub(crate) fn build_cookie_reply(
 }
 
 /// Decrypt and authenticate a received cookie reply against the `mac1` of
-/// the last handshake message we sent (whitepaper §5.4.7: the AEAD's
-/// additional data binds the reply to our message).
-///
-/// # Errors
-/// `InvalidCookie` if authentication fails.
-pub(crate) fn consume_cookie_reply(
-    keys: &MacKeys,
-    last_sent_mac1: &[u8; 16],
+/// a handshake message we sent (whitepaper §5.4.7: the AEAD's additional
+/// data binds the reply to our message). If it authenticates the cookie
+/// is stored in `cookie` and `true` is returned; otherwise `cookie` is
+/// left as it was.
+pub(crate) fn consume_cookie_reply<P: CryptoProvider>(
+    keys: &PeerMacKeys,
+    sent_mac1: &[u8; 16],
     msg: &CookieReply<'_>,
     now: Ticks,
-) -> Result<LastCookie, Error> {
-    let mut cookie = [0u8; 16];
-    let opened = aead::xopen(
-        &keys.cookie_recv,
-        msg.nonce,
-        last_sent_mac1,
-        msg.encrypted_cookie,
-        &mut cookie,
-    );
-    if opened != Ok(16) {
-        return Err(Error::InvalidCookie);
-    }
-    Ok(LastCookie::new(cookie, now))
-}
-
-/// An **interface-level** cookie checker for an endpoint that terminates
-/// **multiple** peers behind one static key (a WireGuard "server").
-///
-/// A [`Tunnel`](crate::Tunnel) carries its own per-peer cookie state — exactly
-/// right for one peer pair, but it cannot be shared: a cookie minted by one
-/// `Tunnel` does not validate on another. A multi-peer responder that
-/// demultiplexes handshake *initiations* by trial (their initiator identity is
-/// encrypted) would therefore issue a different cookie from each peer and never
-/// converge under load. `mac1` verification and the cookie secret are, however,
-/// keyed **only by our own static public key** — identical for every peer on
-/// the interface — so they belong here, once, in front of the per-peer
-/// `Tunnel`s.
-///
-/// Usage: run [`gate`](Self::gate) on every inbound **handshake initiation**
-/// before dispatching it to a peer `Tunnel`; on [`HandshakeGate::Pass`],
-/// dispatch with `under_load = false` (the cookie decision was made here).
-/// Datagrams that carry a receiver index (transport / handshake response /
-/// cookie reply) are demultiplexed by that index straight to the owning
-/// `Tunnel` and do **not** go through the checker.
-///
-/// This composes only the primitives the per-peer path already uses
-/// (constant-time `mac1`, the rotating cookie secret, the XChaCha20 cookie
-/// reply); it introduces no new cryptography.
-#[derive(Debug)]
-pub struct CookieChecker {
-    keys: MacKeys,
-    jar: CookieJar,
-}
-
-/// The outcome of [`CookieChecker::gate`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandshakeGate {
-    /// `mac1` was invalid (or the datagram is not a parseable initiation):
-    /// drop it silently; do not dispatch.
-    Drop,
-    /// Under load with no valid `mac2`: `out[..len]` holds a cookie reply to
-    /// send back to the source. Do not dispatch to a peer.
-    CookieReply(usize),
-    /// The initiation cleared the cookie gate: dispatch it to the owning peer
-    /// `Tunnel` with `under_load = false`.
-    Pass,
-}
-
-impl CookieChecker {
-    /// Create a checker for the interface whose static **public** key is
-    /// `local_public` (the key every peer on this socket shares).
-    #[must_use]
-    pub fn new(local_public: &PublicKey) -> Self {
-        // Only `mac1_recv` and `cookie_send` are used, and both are keyed by
-        // `local_public`; the (unused) per-peer halves are harmless.
-        Self {
-            keys: MacKeys::new(local_public, local_public),
-            jar: CookieJar::new(),
+    cookie: &mut LastCookie,
+) -> bool {
+    let mut buf = *msg.encrypted_cookie;
+    let opened = P::xopen_in_place(&keys.cookie_recv, msg.nonce, sent_mac1, &mut buf);
+    let accepted = match buf.first_chunk::<16>() {
+        Some(value) if opened == Some(16) => {
+            cookie.store(value, now);
+            true
         }
-    }
-
-    /// Gate one inbound handshake-initiation `datagram` from `remote` (the
-    /// caller's stable IP+port encoding, exactly as for
-    /// [`Tunnel::decapsulate`](crate::Tunnel::decapsulate)).
-    ///
-    /// When `under_load` is `true`, an initiation without a valid `mac2` is
-    /// answered with a cookie reply built into `out` instead of being passed
-    /// on. Non-initiation or malformed input maps to [`HandshakeGate::Pass`]
-    /// (let the caller's normal index routing handle or drop it); a bad `mac1`
-    /// maps to [`HandshakeGate::Drop`].
-    ///
-    /// # Errors
-    /// [`Error::BufferTooSmall`] (`out` must be ≥ 64 bytes) or
-    /// [`Error::EntropyFailure`] while building the cookie reply. Attacker
-    /// input never errors.
-    pub fn gate(
-        &mut self,
-        now: Now,
-        remote: &[u8],
-        under_load: bool,
-        datagram: &[u8],
-        out: &mut [u8],
-        rng: &mut dyn EntropySource,
-    ) -> Result<HandshakeGate, Error> {
-        let m = match message::parse(datagram) {
-            Ok(message::Packet::HandshakeInitiation(m)) => m,
-            _ => return Ok(HandshakeGate::Pass),
-        };
-        if !verify_mac1(&self.keys, m.alpha, m.mac1) {
-            return Ok(HandshakeGate::Drop);
-        }
-        if under_load && !self.jar.verify_mac2(remote, m.beta, m.mac2) {
-            let n = build_cookie_reply(
-                &self.keys,
-                &mut self.jar,
-                now.ticks,
-                rng,
-                m.sender_index,
-                m.mac1,
-                remote,
-                out,
-            )?;
-            return Ok(HandshakeGate::CookieReply(n));
-        }
-        Ok(HandshakeGate::Pass)
-    }
+        _ => false,
+    };
+    ct::wipe_array(&mut buf);
+    accepted
 }
 
 #[cfg(test)]
@@ -417,15 +552,23 @@ mod tests {
     use super::*;
     use crate::StaticSecret;
     use crate::consts::HANDSHAKE_INITIATION_LEN;
+    use crate::crypto::{InTree, blake2s};
     use crate::message::{Packet, parse};
     use crate::testing::DeterministicRng;
     use std::vec;
 
-    fn keypairs() -> (MacKeys, MacKeys) {
+    type P = InTree;
+
+    /// (initiator's keys for talking to the responder, the responder's own
+    /// device keys).
+    fn keypairs() -> (PeerMacKeys, DeviceMacKeys) {
         let mut rng = DeterministicRng::new(0xc00c1e);
-        let a = StaticSecret::generate(&mut rng).unwrap().public_key();
-        let b = StaticSecret::generate(&mut rng).unwrap().public_key();
-        (MacKeys::new(&a, &b), MacKeys::new(&b, &a))
+        let _initiator = StaticSecret::generate(&mut rng).unwrap().public_key();
+        let responder = StaticSecret::generate(&mut rng).unwrap().public_key();
+        (
+            PeerMacKeys::new::<P>(&responder),
+            DeviceMacKeys::new::<P>(&responder),
+        )
     }
 
     fn blank_initiation() -> std::vec::Vec<u8> {
@@ -434,19 +577,45 @@ mod tests {
         msg
     }
 
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Mint a cookie as a value (the library itself never does).
+    fn mint(
+        jar: &mut CookieJar,
+        now: Ticks,
+        rng: &mut DeterministicRng,
+        remote: &[u8],
+    ) -> [u8; 16] {
+        let mut cookie = [0u8; 16];
+        jar.mint::<P>(now, rng, remote, &mut cookie).unwrap();
+        cookie
+    }
+
+    /// A stored cookie with this value.
+    fn stored(value: [u8; 16], now: Ticks) -> LastCookie {
+        let mut cookie = LastCookie::none();
+        cookie.store(&value, now);
+        cookie
+    }
+
     #[test]
     fn mac1_roundtrip_and_direction() {
         let (ours, theirs) = keypairs();
         let mut msg = blank_initiation();
-        apply_macs(&ours, None, Ticks::ZERO, &mut msg).unwrap();
+        apply_macs::<P>(&ours, &LastCookie::none(), Ticks::ZERO, &mut msg).unwrap();
         let parsed = match parse(&msg).unwrap() {
             Packet::HandshakeInitiation(m) => m,
             _ => unreachable!(),
         };
-        // The receiver (them) verifies with their recv key.
-        assert!(verify_mac1(&theirs, parsed.alpha, parsed.mac1));
-        // We cannot verify our own sent mac1 (it is keyed by their pub).
-        assert!(!verify_mac1(&ours, parsed.alpha, parsed.mac1));
+        // The receiver verifies with the key derived from ITS public key.
+        assert!(verify_mac1::<P>(&theirs, parsed.alpha, parsed.mac1));
+        // A device with a different public key does not.
+        let mut rng = DeterministicRng::new(1);
+        let other =
+            DeviceMacKeys::new::<P>(&StaticSecret::generate(&mut rng).unwrap().public_key());
+        assert!(!verify_mac1::<P>(&other, parsed.alpha, parsed.mac1));
         // mac2 is zero without a cookie.
         assert_eq!(parsed.mac2, &[0u8; 16]);
         // Any body tamper breaks mac1.
@@ -457,7 +626,7 @@ mod tests {
                 Ok(Packet::HandshakeInitiation(m)) => m,
                 _ => continue, // header tampering may fail parsing: fine
             };
-            assert!(!verify_mac1(&theirs, p.alpha, p.mac1), "byte {byte}");
+            assert!(!verify_mac1::<P>(&theirs, p.alpha, p.mac1), "byte {byte}");
         }
     }
 
@@ -468,16 +637,23 @@ mod tests {
         let mut rng = DeterministicRng::new(0xfeed);
         let (peer_keys, our_keys) = keypairs();
         let now = Ticks::from_secs(100);
-        let remote = b"192.0.2.33:51820";
+        let remote = RemoteBytes::new(addr("192.0.2.33:51820"));
 
         let mut init = blank_initiation();
-        let peer_mac1 = apply_macs(&peer_keys, None, now, &mut init).unwrap();
+        let peer_mac1 = apply_macs::<P>(&peer_keys, &LastCookie::none(), now, &mut init).unwrap();
 
         // Under load: we answer with a cookie reply instead of processing.
         let mut jar = CookieJar::new();
         let mut reply = vec![0u8; COOKIE_REPLY_LEN];
-        let n = build_cookie_reply(
-            &our_keys, &mut jar, now, &mut rng, 7, &peer_mac1, remote, &mut reply,
+        let n = build_cookie_reply::<P>(
+            &our_keys,
+            &mut jar,
+            now,
+            &mut rng,
+            7,
+            &peer_mac1,
+            remote.as_slice(),
+            &mut reply,
         )
         .unwrap();
         assert_eq!(n, COOKIE_REPLY_LEN);
@@ -487,25 +663,43 @@ mod tests {
             Packet::CookieReply(m) => m,
             _ => unreachable!(),
         };
-        let cookie = consume_cookie_reply(&peer_keys, &peer_mac1, &parsed, now).unwrap();
+        let mut cookie = LastCookie::none();
+        assert!(consume_cookie_reply::<P>(
+            &peer_keys,
+            &peer_mac1,
+            &parsed,
+            now,
+            &mut cookie
+        ));
+        assert!(cookie.is_some());
 
         // ...and retransmits with mac2 filled.
         let mut retry = blank_initiation();
-        apply_macs(&peer_keys, Some(&cookie), now.add_nanos(1), &mut retry).unwrap();
+        apply_macs::<P>(&peer_keys, &cookie, now.add_nanos(1), &mut retry).unwrap();
         let parsed = match parse(&retry).unwrap() {
             Packet::HandshakeInitiation(m) => m,
             _ => unreachable!(),
         };
         assert_ne!(parsed.mac2, &[0u8; 16]);
-        assert!(verify_mac1(&our_keys, parsed.alpha, parsed.mac1));
-        assert!(jar.verify_mac2(remote, parsed.beta, parsed.mac2));
+        assert!(verify_mac1::<P>(&our_keys, parsed.alpha, parsed.mac1));
+        assert!(jar.verify_mac2::<P>(now, remote.as_slice(), parsed.beta, parsed.mac2));
 
         // mac2 does not verify for a different remote address (IP
-        // ownership proof) nor for tampered bodies.
-        assert!(!jar.verify_mac2(b"198.51.100.9:7", parsed.beta, parsed.mac2));
+        // ownership proof), a different port, nor for tampered bodies.
+        for other in ["198.51.100.9:7", "192.0.2.33:51821", "[2001:db8::1]:51820"] {
+            assert!(
+                !jar.verify_mac2::<P>(
+                    now,
+                    RemoteBytes::new(addr(other)).as_slice(),
+                    parsed.beta,
+                    parsed.mac2
+                ),
+                "{other}"
+            );
+        }
         let mut other_beta = parsed.beta.to_vec();
         other_beta[10] ^= 1;
-        assert!(!jar.verify_mac2(remote, &other_beta, parsed.mac2));
+        assert!(!jar.verify_mac2::<P>(now, remote.as_slice(), &other_beta, parsed.mac2));
     }
 
     #[test]
@@ -516,7 +710,7 @@ mod tests {
         let mac1 = [0xaa; 16];
         let mut jar = CookieJar::new();
         let mut reply = vec![0u8; COOKIE_REPLY_LEN];
-        build_cookie_reply(
+        build_cookie_reply::<P>(
             &our_keys, &mut jar, now, &mut rng, 1, &mac1, b"r", &mut reply,
         )
         .unwrap();
@@ -526,10 +720,16 @@ mod tests {
             Packet::CookieReply(m) => m,
             _ => unreachable!(),
         };
-        assert_eq!(
-            consume_cookie_reply(&peer_keys, &[0xbb; 16], &parsed, now).err(),
-            Some(Error::InvalidCookie)
-        );
+        // A reply that does not open leaves the cookie we hold alone.
+        let mut cookie = stored([9; 16], now);
+        assert!(!consume_cookie_reply::<P>(
+            &peer_keys,
+            &[0xbb; 16],
+            &parsed,
+            now,
+            &mut cookie
+        ));
+        assert_eq!(cookie.fresh_value(now), Some(&[9; 16]));
         // Bit flips anywhere in nonce or ciphertext.
         for byte in 8..COOKIE_REPLY_LEN {
             let mut bad = reply.clone();
@@ -539,60 +739,213 @@ mod tests {
                 _ => unreachable!(),
             };
             assert!(
-                consume_cookie_reply(&peer_keys, &mac1, &parsed, now).is_err(),
+                !consume_cookie_reply::<P>(&peer_keys, &mac1, &parsed, now, &mut cookie),
                 "byte {byte}"
             );
+            assert_eq!(cookie.fresh_value(now), Some(&[9; 16]), "byte {byte}");
         }
         // The genuine reply with the right binding works.
         let parsed = match parse(&reply).unwrap() {
             Packet::CookieReply(m) => m,
             _ => unreachable!(),
         };
-        assert!(consume_cookie_reply(&peer_keys, &mac1, &parsed, now).is_ok());
+        assert!(consume_cookie_reply::<P>(
+            &peer_keys,
+            &mac1,
+            &parsed,
+            now,
+            &mut cookie
+        ));
+        assert_ne!(
+            cookie.fresh_value(now),
+            Some(&[9; 16]),
+            "the new cookie replaced the old one"
+        );
+        // Too-small output buffer is a local fault, reported before any
+        // entropy is drawn or state changes.
+        let mut tiny = [0u8; COOKIE_REPLY_LEN - 1];
+        let mut fresh = CookieJar::new();
+        assert_eq!(
+            build_cookie_reply::<P>(
+                &our_keys, &mut fresh, now, &mut rng, 1, &mac1, b"r", &mut tiny
+            ),
+            Err(Error::BufferTooSmall)
+        );
+        assert!(!fresh.primed);
     }
 
     #[test]
     fn cookies_expire_and_secrets_rotate() {
         let mut rng = DeterministicRng::new(11);
         let now = Ticks::from_secs(1000);
-        let cookie = LastCookie::new([7; 16], now);
-        assert!(cookie.fresh_value(now).is_some());
+        let none = LastCookie::none();
+        assert!(!none.is_some() && none.fresh_value(now).is_none());
+        let mut cookie = stored([7; 16], now);
+        assert!(cookie.is_some());
+        assert_eq!(cookie.fresh_value(now), Some(&[7; 16]));
         assert!(
             cookie
                 .fresh_value(now.add_nanos(COOKIE_LIFETIME - 1))
                 .is_some()
         );
         assert!(cookie.fresh_value(now.add_nanos(COOKIE_LIFETIME)).is_none());
+        // Clearing wipes the value where it lies.
+        cookie.clear();
+        assert!(!cookie.is_some() && cookie.fresh_value(now).is_none());
+        assert_eq!(cookie.value, [0u8; 16]);
 
         // Jar: a cookie minted now verifies now and within one rotation,
         // but not after two.
         let mut jar = CookieJar::new();
         let remote = b"10.0.0.1:1";
         let beta = b"some message beta bytes";
-        let c = jar.mint(now, &mut rng, remote).unwrap();
+        let c = mint(&mut jar, now, &mut rng, remote);
         let mac2 = blake2s::mac(&c, &[beta.as_slice()]);
-        assert!(jar.verify_mac2(remote, beta, &mac2));
+        assert!(jar.verify_mac2::<P>(now, remote, beta, &mac2));
         // Force one rotation: old secret moves to `previous`, still valid.
-        let _ = jar
-            .mint(now.add_nanos(COOKIE_LIFETIME), &mut rng, remote)
-            .unwrap();
-        assert!(jar.verify_mac2(remote, beta, &mac2), "previous secret");
+        let later = now.add_nanos(COOKIE_LIFETIME);
+        let _ = mint(&mut jar, later, &mut rng, remote);
+        assert!(
+            jar.verify_mac2::<P>(later, remote, beta, &mac2),
+            "previous secret"
+        );
         // Second rotation: gone.
-        let _ = jar
-            .mint(now.add_nanos(2 * COOKIE_LIFETIME), &mut rng, remote)
-            .unwrap();
-        assert!(!jar.verify_mac2(remote, beta, &mac2), "two rotations");
+        let later = now.add_nanos(2 * COOKIE_LIFETIME);
+        let _ = mint(&mut jar, later, &mut rng, remote);
+        assert!(
+            !jar.verify_mac2::<P>(later, remote, beta, &mac2),
+            "two rotations"
+        );
+    }
+
+    /// A secret stops verifying a lifetime and the grace after it was
+    /// drawn even if nothing is minted in the meantime (rotation happens at
+    /// the next mint), and a late rotation does not bring it back as
+    /// `previous`.
+    #[test]
+    fn a_secret_ages_out_without_being_rotated() {
+        let mut rng = DeterministicRng::new(12);
+        let drawn = Ticks::from_secs(50);
+        let mut jar = CookieJar::new();
+        let remote = b"10.0.0.1:1";
+        let beta = b"some message beta bytes";
+        // Two rotations first, so `previous` is a real secret throughout.
+        let _ = mint(&mut jar, Ticks::ZERO, &mut rng, remote);
+        let c = mint(&mut jar, drawn, &mut rng, remote);
+        // (not a rotation: 50 s < COOKIE_LIFETIME, same secret as at 0)
+        let mac2 = blake2s::mac(&c, &[beta.as_slice()]);
+        let dies = Ticks::ZERO.add_nanos(COOKIE_LIFETIME + COOKIE_SECRET_GRACE);
+        assert!(jar.verify_mac2::<P>(drawn, remote, beta, &mac2));
+        assert!(jar.verify_mac2::<P>(Ticks::from_nanos(dies.nanos() - 1), remote, beta, &mac2));
+        assert!(
+            !jar.verify_mac2::<P>(dies, remote, beta, &mac2),
+            "nothing was minted since, but the secret is past its time"
+        );
+        // Hours later load returns and a cookie is minted: the old secret
+        // becomes `previous`, and stays dead.
+        let hours_later = Ticks::from_secs(7200);
+        let fresh = mint(&mut jar, hours_later, &mut rng, remote);
+        assert_ne!(fresh, c);
+        assert!(!jar.verify_mac2::<P>(hours_later, remote, beta, &mac2));
+        let fresh_mac2 = blake2s::mac(&fresh, &[beta.as_slice()]);
+        assert!(jar.verify_mac2::<P>(hours_later, remote, beta, &fresh_mac2));
+    }
+
+    /// After a rotation the secret before is honoured for the grace — a
+    /// cookie handed out just before the rotation is good for the
+    /// retransmission it was asked for — and not a nanosecond longer.
+    #[test]
+    fn the_previous_secret_is_honoured_for_the_grace_only() {
+        let mut rng = DeterministicRng::new(13);
+        let mut jar = CookieJar::new();
+        let remote = b"10.0.0.1:1";
+        let beta = b"some message beta bytes";
+        let _ = mint(&mut jar, Ticks::ZERO, &mut rng, remote);
+        // A second secret, so that the one before it is a real one; a
+        // cookie from it at the last moment it makes any.
+        let drawn = Ticks::ZERO.add_nanos(COOKIE_LIFETIME);
+        let _ = mint(&mut jar, drawn, &mut rng, remote);
+        let last_minute = Ticks::from_nanos(drawn.nanos() + COOKIE_LIFETIME - 1);
+        let old = mint(&mut jar, last_minute, &mut rng, remote);
+        let old_mac2 = blake2s::mac(&old, &[beta.as_slice()]);
+        let secret_before = jar.secret;
+        // The rotation.
+        let rotation = drawn.add_nanos(COOKIE_LIFETIME);
+        let new = mint(&mut jar, rotation, &mut rng, remote);
+        assert_ne!(new, old);
+        assert_eq!(jar.previous, secret_before, "the secrets changed places");
+        assert_ne!(jar.secret, secret_before);
+        let new_mac2 = blake2s::mac(&new, &[beta.as_slice()]);
+        let grace_ends = rotation.add_nanos(COOKIE_SECRET_GRACE);
+        let just_before = Ticks::from_nanos(grace_ends.nanos() - 1);
+        assert!(jar.verify_mac2::<P>(rotation, remote, beta, &old_mac2));
+        assert!(jar.verify_mac2::<P>(just_before, remote, beta, &old_mac2));
+        assert!(!jar.verify_mac2::<P>(grace_ends, remote, beta, &old_mac2));
+        // The new one is unaffected by any of that.
+        for at in [rotation, just_before, grace_ends] {
+            assert!(jar.verify_mac2::<P>(at, remote, beta, &new_mac2));
+        }
+    }
+
+    /// A rotation that cannot get its entropy changes nothing that
+    /// matters: the secret in use stays, cookies from it keep verifying,
+    /// and the next attempt rotates.
+    #[test]
+    fn a_failed_rotation_leaves_the_secret_in_use_alone() {
+        struct Failing;
+        impl crate::EntropySource for Failing {
+            fn fill(&mut self, buf: &mut [u8]) -> Result<(), crate::EntropyError> {
+                // Half written, then the failure: the worst a source may do.
+                let half = buf.len() / 2;
+                buf[..half].fill(0xee);
+                Err(crate::EntropyError)
+            }
+        }
+        let mut rng = DeterministicRng::new(14);
+        let mut jar = CookieJar::new();
+        let remote = b"10.0.0.1:1";
+        let beta = b"some message beta bytes";
+        let _ = mint(&mut jar, Ticks::ZERO, &mut rng, remote);
+        let drawn = Ticks::ZERO.add_nanos(COOKIE_LIFETIME);
+        let cookie = mint(&mut jar, drawn, &mut rng, remote);
+        let mac2 = blake2s::mac(&cookie, &[beta.as_slice()]);
+        let secret = jar.secret;
+
+        let due = drawn.add_nanos(COOKIE_LIFETIME);
+        assert_eq!(
+            jar.mint::<P>(due, &mut Failing, remote, &mut [0u8; 16])
+                .err(),
+            Some(Error::EntropyFailure)
+        );
+        assert_eq!(jar.secret, secret);
+        assert_eq!(jar.rotated_at, drawn);
+        assert!(jar.primed);
+        // What was half drawn is not kept, and not taken for a secret.
+        assert_eq!(jar.previous, [0u8; 32]);
+        assert!(!jar.has_previous);
+        assert!(jar.verify_mac2::<P>(due, remote, beta, &mac2));
+        // A forgery keyed on the wiped place of the previous secret gets
+        // nowhere.
+        let zero_cookie = blake2s::mac(&[0u8; 32], &[remote.as_slice()]);
+        let zero_mac2 = blake2s::mac(&zero_cookie, &[beta.as_slice()]);
+        assert!(!jar.verify_mac2::<P>(due, remote, beta, &zero_mac2));
+        // With entropy again: a new secret, the old one behind it.
+        let fresh = mint(&mut jar, due, &mut rng, remote);
+        assert_ne!(fresh, cookie);
+        assert_eq!(jar.previous, secret);
+        assert!(jar.has_previous);
+        assert!(jar.verify_mac2::<P>(due, remote, beta, &mac2));
     }
 
     #[test]
     fn unprimed_jar_rejects_all_mac2() {
         let jar = CookieJar::new();
-        assert!(!jar.verify_mac2(b"r", b"beta", &[0u8; 16]));
+        assert!(!jar.verify_mac2::<P>(Ticks::ZERO, b"r", b"beta", &[0u8; 16]));
         // All-zero mac2 (the "no cookie" wire value) must never verify.
         let mut rng = DeterministicRng::new(1);
         let mut jar = CookieJar::new();
-        let _ = jar.mint(Ticks::ZERO, &mut rng, b"r").unwrap();
-        assert!(!jar.verify_mac2(b"r", b"beta", &[0u8; 16]));
+        let _ = mint(&mut jar, Ticks::ZERO, &mut rng, b"r");
+        assert!(!jar.verify_mac2::<P>(Ticks::ZERO, b"r", b"beta", &[0u8; 16]));
     }
 
     /// Regression: after the first rotation `previous` is the all-zero
@@ -602,31 +955,33 @@ mod tests {
     fn jar_rejects_mac2_keyed_on_all_zero_previous() {
         let mut rng = DeterministicRng::new(0xa7);
         let mut jar = CookieJar::new();
-        let _ = jar.mint(Ticks::ZERO, &mut rng, b"x").unwrap();
+        let _ = mint(&mut jar, Ticks::ZERO, &mut rng, b"x");
         let remote = b"203.0.113.5:51820";
         let beta = b"some 116- or 76-byte msg-beta prefix the attacker built";
         let forged_cookie = blake2s::mac(&[0u8; 32], &[remote.as_slice()]);
         let forged_mac2 = blake2s::mac(&forged_cookie, &[beta.as_slice()]);
         assert!(
-            !jar.verify_mac2(remote, beta, &forged_mac2),
+            !jar.verify_mac2::<P>(Ticks::ZERO, remote, beta, &forged_mac2),
             "all-zero `previous` must never be accepted as a mac2 key"
         );
         // After a real second rotation, the (now random) previous works.
-        let c = jar.mint(Ticks::ZERO, &mut rng, remote).unwrap();
+        let c = mint(&mut jar, Ticks::ZERO, &mut rng, remote);
         let real_mac2 = blake2s::mac(&c, &[beta.as_slice()]);
-        let _ = jar
-            .mint(Ticks::ZERO.add_nanos(COOKIE_LIFETIME), &mut rng, remote)
-            .unwrap();
-        assert!(jar.verify_mac2(remote, beta, &real_mac2), "real previous");
+        let later = Ticks::ZERO.add_nanos(COOKIE_LIFETIME);
+        let _ = mint(&mut jar, later, &mut rng, remote);
+        assert!(
+            jar.verify_mac2::<P>(later, remote, beta, &real_mac2),
+            "real previous"
+        );
     }
 
-    /// L-4 regression: entropy failure during the first prime's nonce
-    /// seed must fail closed (not silently fall back to counter = 0,
-    /// which would replay XChaCha20 nonces across restarts).
+    /// Regression: entropy failure while drawing the nonce key at the
+    /// first prime must fail closed (not silently fall back to an
+    /// all-zero key, which would repeat XChaCha20 nonces across restarts).
     #[test]
     fn jar_prime_fails_closed_on_nonce_seed_entropy_failure() {
-        // Succeeds for the 32-byte secret, then fails for the 24-byte
-        // nonce seed.
+        // Succeeds for the 32-byte secret, then fails for the 16-byte
+        // nonce key.
         struct OneShotRng {
             inner: DeterministicRng,
             calls: u32,
@@ -646,119 +1001,136 @@ mod tests {
             calls: 0,
         };
         let mut jar = CookieJar::new();
-        // Prime fails on the nonce seed → EntropyFailure, NOT a primed
-        // jar with nonce_counter = 0.
+        // Prime fails on the nonce key → EntropyFailure, NOT a primed
+        // jar with an all-zero key.
         assert_eq!(
-            jar.mint(Ticks::ZERO, &mut bad, b"r").err(),
+            jar.mint::<P>(Ticks::ZERO, &mut bad, b"r", &mut [0u8; 16])
+                .err(),
             Some(Error::EntropyFailure)
         );
         assert!(!jar.primed, "jar must not commit a half-prime");
         assert!(
-            !jar.verify_mac2(b"r", b"beta", &[0u8; 16]),
+            !jar.verify_mac2::<P>(Ticks::ZERO, b"r", b"beta", &[0u8; 16]),
             "unprimed jar accepts nothing"
         );
         // A subsequent call with working entropy primes cleanly.
         let mut good = DeterministicRng::new(8);
-        assert!(jar.mint(Ticks::ZERO, &mut good, b"r").is_ok());
+        assert!(
+            jar.mint::<P>(Ticks::ZERO, &mut good, b"r", &mut [0u8; 16])
+                .is_ok()
+        );
         assert!(jar.primed);
-        assert_ne!(
-            jar.nonce_counter,
-            [0, 0, 0],
-            "nonce counter must be entropy-seeded"
-        );
+        assert_ne!(jar.nonce_key, [0u8; 16], "the nonce key must be drawn");
     }
 
+    /// Cookie-reply nonces take no entropy per reply, never repeat — and
+    /// say nothing about how many replies have been sent: as integers
+    /// they are nowhere near each other, and every one of their 192 bits
+    /// changes from reply to reply about half the time. (A counter — what
+    /// this used to be — fails all three of the last checks.)
     #[test]
-    fn cookie_reply_nonces_are_unique_and_entropy_free() {
-        // Two replies under load draw no per-reply entropy and never
-        // repeat a nonce.
-        let mut rng = DeterministicRng::new(5);
+    fn cookie_reply_nonces_are_unique_free_and_not_a_counter() {
+        /// Fails once the jar is primed: per-reply entropy would show.
+        struct PrimeOnly(DeterministicRng, u32);
+        impl crate::EntropySource for PrimeOnly {
+            fn fill(&mut self, buf: &mut [u8]) -> Result<(), crate::EntropyError> {
+                self.1 = self.1.saturating_add(1);
+                self.0.fill(buf)
+            }
+        }
+        let keys = DeviceMacKeys::new::<P>(&PublicKey::from_bytes([9; 32]));
+        let mut rng = PrimeOnly(DeterministicRng::new(5), 0);
         let mut jar = CookieJar::new();
-        let _ = jar.mint(Ticks::ZERO, &mut rng, b"r").unwrap(); // primes
-        let n1 = jar.next_nonce();
-        let n2 = jar.next_nonce();
-        assert_ne!(n1, n2);
-        // 192-bit carry across word boundaries.
+        let mut nonces: std::vec::Vec<[u8; 24]> = std::vec::Vec::new();
+        let mut draws_after_first = None;
+        for i in 0..2000u32 {
+            let mut out = [0u8; COOKIE_REPLY_LEN];
+            let n = build_cookie_reply::<P>(
+                &keys,
+                &mut jar,
+                Ticks::ZERO,
+                &mut rng,
+                i,
+                &[7; 16],
+                b"remote",
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(n, COOKIE_REPLY_LEN);
+            nonces.push(out[8..32].try_into().unwrap());
+            draws_after_first.get_or_insert(rng.1);
+        }
+        assert_eq!(
+            Some(rng.1),
+            draws_after_first,
+            "entropy was drawn for a reply after the first"
+        );
+        let distinct: std::collections::HashSet<_> = nonces.iter().collect();
+        assert_eq!(distinct.len(), nonces.len(), "a nonce repeated");
+
+        // Not a counter, in any byte order or position: consecutive nonces
+        // share no 8-byte word…
+        for pair in nonces.windows(2) {
+            for word in 0..3 {
+                assert_ne!(
+                    pair[0][word * 8..word * 8 + 8],
+                    pair[1][word * 8..word * 8 + 8],
+                    "consecutive nonces share a word"
+                );
+            }
+        }
+        // …and every bit flips between consecutive replies between a
+        // third and two thirds of the time.
+        for bit in 0..192 {
+            let flips = nonces
+                .windows(2)
+                .filter(|p| (p[0][bit / 8] ^ p[1][bit / 8]) >> (bit % 8) & 1 == 1)
+                .count();
+            assert!(
+                (nonces.len() / 3..nonces.len() * 2 / 3).contains(&flips),
+                "bit {bit} flipped {flips} times in {} replies",
+                nonces.len()
+            );
+        }
+
+        // Another run (another key) under the same static key: no nonce
+        // in common, although both count from the same place.
+        let mut rng2 = DeterministicRng::new(6);
         let mut jar2 = CookieJar::new();
-        jar2.nonce_counter = [u64::MAX, u64::MAX, 0];
-        jar2.primed = true;
-        let n = jar2.next_nonce();
-        assert_eq!(jar2.nonce_counter, [0, 0, 1]);
-        assert_eq!(&n[16..], 1u64.to_le_bytes());
+        let _ = mint(&mut jar2, Ticks::ZERO, &mut rng2, b"r"); // primes
+        assert_eq!(jar2.nonce_counter, 0);
+        for _ in 0..2000 {
+            assert!(!distinct.contains(&jar2.next_nonce()));
+        }
     }
 
-    /// The interface-level cookie checker gates initiations exactly like the
-    /// per-peer path, but with one shared secret — the property a multi-peer
-    /// responder needs so the cookie a peer minted validates no matter which
-    /// peer ultimately processes the retry.
     #[test]
-    fn cookie_checker_gate_dance() {
-        let mut rng = DeterministicRng::new(0x1ace);
-        let local = StaticSecret::generate(&mut rng).unwrap().public_key();
-        // Initiator-side keys: both halves key off `local`, so `mac1_send`
-        // and `cookie_recv` line up with the checker's `mac1_recv` /
-        // `cookie_send`.
-        let init_keys = MacKeys::new(&local, &local);
-        let now = Now::new(100_000_000_000, 1, 0);
-        let remote = b"192.0.2.5:51820";
-
-        let mut checker = CookieChecker::new(&local);
-        let mut out = vec![0u8; COOKIE_REPLY_LEN];
-
-        let mut init = blank_initiation();
-        let init_mac1 = apply_macs(&init_keys, None, now.ticks, &mut init).unwrap();
-
-        // Not under load → straight through.
-        assert_eq!(
-            checker
-                .gate(now, remote, false, &init, &mut out, &mut rng)
-                .unwrap(),
-            HandshakeGate::Pass
+    fn remote_bytes_encoding_is_canonical() {
+        // IPv4: 4 address bytes + big-endian port.
+        let v4 = RemoteBytes::new(addr("192.0.2.7:51820"));
+        assert_eq!(v4.as_slice(), &[192, 0, 2, 7, 0xca, 0x6c]);
+        // IPv6: 16 address bytes + big-endian port.
+        let v6 = RemoteBytes::new(addr("[2001:db8::1]:258"));
+        assert_eq!(v6.as_slice().len(), 18);
+        assert_eq!(&v6.as_slice()[..4], &[0x20, 0x01, 0x0d, 0xb8]);
+        assert_eq!(v6.as_slice()[15], 1);
+        assert_eq!(&v6.as_slice()[16..], &[1, 2]);
+        // An IPv4-mapped IPv6 address is the same host as the IPv4 one.
+        let mapped = RemoteBytes::new(addr("[::ffff:192.0.2.7]:51820"));
+        assert_eq!(mapped.as_slice(), v4.as_slice());
+        // Port and address both matter.
+        assert_ne!(
+            RemoteBytes::new(addr("192.0.2.7:51821")).as_slice(),
+            v4.as_slice()
         );
-
-        // Under load, no mac2 → a cookie reply.
-        let n = match checker
-            .gate(now, remote, true, &init, &mut out, &mut rng)
-            .unwrap()
-        {
-            HandshakeGate::CookieReply(n) => n,
-            other => unreachable!("{other:?}"),
-        };
-        assert_eq!(n, COOKIE_REPLY_LEN);
-
-        // Initiator consumes the cookie and retries with mac2 filled.
-        let parsed = match parse(&out).unwrap() {
-            Packet::CookieReply(m) => m,
-            _ => unreachable!(),
-        };
-        let cookie = consume_cookie_reply(&init_keys, &init_mac1, &parsed, now.ticks).unwrap();
-        let mut retry = blank_initiation();
-        apply_macs(&init_keys, Some(&cookie), now.ticks, &mut retry).unwrap();
-
-        // Under load, valid mac2 → Pass.
-        assert_eq!(
-            checker
-                .gate(now, remote, true, &retry, &mut out, &mut rng)
-                .unwrap(),
-            HandshakeGate::Pass
+        assert_ne!(
+            RemoteBytes::new(addr("192.0.2.8:51820")).as_slice(),
+            v4.as_slice()
         );
-
-        // Body tamper breaks mac1 → Drop.
-        let mut bad = retry.clone();
-        bad[12] ^= 0x40;
+        // An IPv4-compatible (not -mapped) IPv6 address stays IPv6.
         assert_eq!(
-            checker
-                .gate(now, remote, true, &bad, &mut out, &mut rng)
-                .unwrap(),
-            HandshakeGate::Drop
+            RemoteBytes::new(addr("[::192.0.2.7]:1")).as_slice().len(),
+            18
         );
-
-        // mac2 bound to a different remote does not validate (IP-ownership).
-        assert!(matches!(
-            checker
-                .gate(now, b"198.51.100.9:7", true, &retry, &mut out, &mut rng)
-                .unwrap(),
-            HandshakeGate::CookieReply(_)
-        ));
     }
 }

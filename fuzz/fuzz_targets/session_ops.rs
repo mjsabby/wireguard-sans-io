@@ -1,90 +1,161 @@
 //! Structured, coverage-guided protocol fuzzing: the fuzzer drives two
-//! real tunnels through an op interpreter (send / deliver / corrupt /
-//! reorder / drop / advance time / poll / under-load), the corpus-guided
-//! twin of `tests/protocol_fuzz.rs`.
+//! real endpoints through an op interpreter (send / deliver / corrupt /
+//! reorder / drop / advance time / poll / under-load / roam / reset), the
+//! corpus-guided twin of `tests/protocol_fuzz.rs`.
 //!
-//! Invariant: every payload delivered as `Data` is byte-exact one that
-//! the peer actually encapsulated.
+//! Invariants, checked after every op:
+//!
+//! * every payload delivered as data is byte-exact one that the peer
+//!   actually encapsulated, and no datagram is accepted twice (the replay
+//!   oracle: duplicates are part of what the fuzzer can do);
+//! * both receive paths behave the same: each delivery goes through the
+//!   single-call path or, at the fuzzer's choice, the two-step routing
+//!   path (`Device::receive` → `identify` / peer id → tunnel);
+//! * a dropped datagram leaves its buffer and the output buffer untouched
+//!   (asserted inside the shared harness on every delivery);
+//! * each tunnel's timers equal the reference model's
+//!   (`tests/common/timer_model.rs`) — the timing oracle;
+//! * a tunnel that reports `Idle` has no wake-up due;
+//! * no call reports a local fault.
 #![no_main]
 
+#[path = "../../tests/common/mod.rs"]
+mod common;
+
+use std::collections::VecDeque;
+use std::net::SocketAddr;
+
 use arbitrary::Arbitrary;
+use common::{Endpoint, a_addr, b_addr, fingerprint};
 use libfuzzer_sys::fuzz_target;
-use std::collections::{HashSet, VecDeque};
+use wireguard_sans_io::EntropySource;
 use wireguard_sans_io::testing::DeterministicRng;
-use wireguard_sans_io::{Config, Encapsulated, Now, PollOutput, Received, StaticSecret, Tunnel};
 
 #[derive(Arbitrary, Debug)]
 enum Op {
-    SendA { len: u16 },
-    SendB { len: u16 },
-    DeliverToA { pick: u8, corrupt_pos: u16, corrupt_val: u8, duplicate: bool },
-    DeliverToB { pick: u8, corrupt_pos: u16, corrupt_val: u8, duplicate: bool },
-    DropToA { pick: u8 },
-    DropToB { pick: u8 },
+    SendA {
+        len: u16,
+    },
+    SendB {
+        len: u16,
+    },
+    DeliverToA {
+        pick: u8,
+        corrupt_pos: u16,
+        corrupt_val: u8,
+        duplicate: bool,
+        under_load: bool,
+        roam: u8,
+        routed: bool,
+    },
+    DeliverToB {
+        pick: u8,
+        corrupt_pos: u16,
+        corrupt_val: u8,
+        duplicate: bool,
+        under_load: bool,
+        roam: u8,
+        routed: bool,
+    },
+    DropToA {
+        pick: u8,
+    },
+    DropToB {
+        pick: u8,
+    },
     AdvanceMillis(u16),
     AdvanceSeconds(u8),
     PollA,
     PollB,
     InitiateA,
+    InitiateB,
+    ResetA,
     ResetB,
 }
 
-fn fingerprint(data: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in data {
-        h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
-    }
-    h ^ (data.len() as u64)
+#[derive(Arbitrary, Debug)]
+struct Scenario {
+    keepalive_a: Option<u8>,
+    keepalive_b: Option<u8>,
+    ops: Vec<Op>,
 }
 
-fuzz_target!(|ops: Vec<Op>| {
-    if ops.len() > 256 {
+fuzz_target!(|scenario: Scenario| {
+    if scenario.ops.len() > 256 {
         return;
     }
+    let ka = |k: Option<u8>| k.filter(|s| *s != 0).map(u16::from);
+    let (ka_a, ka_b) = (ka(scenario.keepalive_a), ka(scenario.keepalive_b));
     let mut keyrng = DeterministicRng::new(0x6b6579);
-    let a_key = StaticSecret::generate(&mut keyrng).unwrap();
-    let b_key = StaticSecret::generate(&mut keyrng).unwrap();
-    let a_pub = a_key.public_key();
-    let b_pub = b_key.public_key();
-    let mut a = Tunnel::new(Config::new(a_key, b_pub)).unwrap();
-    let mut b = Tunnel::new(Config::new(b_key, a_pub)).unwrap();
-    let mut rng_a = DeterministicRng::new(3);
-    let mut rng_b = DeterministicRng::new(5);
+    let (a_key, a_pub) = common::keypair(&mut keyrng);
+    let (b_key, b_pub) = common::keypair(&mut keyrng);
+    let mut a = Endpoint::new(
+        "A",
+        common::side(
+            a_key,
+            b_pub,
+            a_addr(),
+            Some(b_addr()),
+            None,
+            ka_a,
+            &mut keyrng,
+        ),
+        ka_a,
+        3,
+    );
+    let mut b = Endpoint::new(
+        "B",
+        common::side(
+            b_key,
+            a_pub,
+            b_addr(),
+            Some(a_addr()),
+            None,
+            ka_b,
+            &mut keyrng,
+        ),
+        ka_b,
+        5,
+    );
 
-    let mut sent_a: HashSet<u64> = HashSet::new(); // padded payload fps A sent
-    let mut sent_b: HashSet<u64> = HashSet::new();
     let mut to_a: VecDeque<Vec<u8>> = VecDeque::new();
     let mut to_b: VecDeque<Vec<u8>> = VecDeque::new();
     let mut mono: u64 = 0;
-    let now = |m: u64| Now::new(m, 1_700_000_000 + m / 1_000_000_000, 0);
 
-    for op in ops {
+    for op in scenario.ops {
         match op {
             Op::SendA { len } | Op::SendB { len } => {
                 let from_a = matches!(op, Op::SendA { .. });
                 let len = usize::from(len) % 1024;
                 let mut payload = vec![0u8; len];
-                let (tunnel, rng, sent, queue) = if from_a {
-                    (&mut a, &mut rng_a, &mut sent_a, &mut to_b)
+                let (ep, queue) = if from_a {
+                    (&mut a, &mut to_b)
                 } else {
-                    (&mut b, &mut rng_b, &mut sent_b, &mut to_a)
+                    (&mut b, &mut to_a)
                 };
-                use wireguard_sans_io::EntropySource;
-                rng.fill(&mut payload).unwrap();
-                let mut wire = vec![0u8; 2048];
-                match tunnel.encapsulate(now(mono), &payload, &mut wire, rng) {
-                    Ok(Encapsulated::Transport(w)) => {
-                        let mut padded = payload.clone();
-                        padded.resize(len.div_ceil(16) * 16, 0);
-                        sent.insert(fingerprint(&padded));
-                        queue.push_back(w.to_vec());
-                    }
-                    Ok(Encapsulated::HandshakeInitiation(w)) => queue.push_back(w.to_vec()),
-                    Err(_) => {}
+                ep.rng.fill(&mut payload).unwrap();
+                if let Some(w) = ep.send(mono, &payload) {
+                    queue.push_back(w);
                 }
             }
-            Op::DeliverToA { pick, corrupt_pos, corrupt_val, duplicate }
-            | Op::DeliverToB { pick, corrupt_pos, corrupt_val, duplicate } => {
+            Op::DeliverToA {
+                pick,
+                corrupt_pos,
+                corrupt_val,
+                duplicate,
+                under_load,
+                roam,
+                routed,
+            }
+            | Op::DeliverToB {
+                pick,
+                corrupt_pos,
+                corrupt_val,
+                duplicate,
+                under_load,
+                roam,
+                routed,
+            } => {
                 let to_a_side = matches!(op, Op::DeliverToA { .. });
                 let queue = if to_a_side { &mut to_a } else { &mut to_b };
                 if queue.is_empty() {
@@ -99,32 +170,27 @@ fuzz_target!(|ops: Vec<Op>| {
                     let pos = usize::from(corrupt_pos) % datagram.len();
                     datagram[pos] ^= corrupt_val;
                 }
-                let (tunnel, rng, peer_sent, reply_queue) = if to_a_side {
-                    (&mut a, &mut rng_a, &sent_b, &mut to_b)
+                let (ep, peer, reply_queue, home) = if to_a_side {
+                    (&mut a, &b, &mut to_b, b_addr())
                 } else {
-                    (&mut b, &mut rng_b, &sent_a, &mut to_a)
+                    (&mut b, &a, &mut to_a, a_addr())
                 };
-                let mut out = vec![0xEEu8; datagram.len() + 256];
-                match tunnel.decapsulate(now(mono), b"fz", false, &datagram, &mut out, rng) {
-                    Ok(Received::Data(d)) => {
-                        assert!(
-                            peer_sent.contains(&fingerprint(d)),
-                            "delivered a never-sent payload"
-                        );
-                    }
-                    Ok(Received::Reply(w)) => reply_queue.push_back(w.to_vec()),
-                    Ok(_) => {}
-                    Err(_) => {
-                        let dirty = out
-                            .iter()
-                            .rev()
-                            .take(256)
-                            .any(|&x| x != 0xEE);
-                        // Only the tail canary is checked (the plaintext
-                        // area length varies); rejected datagrams must
-                        // never write past anything.
-                        assert!(!dirty, "rejected datagram wrote into buffer tail");
-                    }
+                // Mostly from the peer's real address, sometimes from
+                // another one (NAT rebinding, or an off-path replay).
+                let src: SocketAddr = if roam < 224 {
+                    home
+                } else {
+                    SocketAddr::new(home.ip(), 40_000 + u16::from(roam))
+                };
+                let (reply, data) = ep.deliver(mono, src, under_load, &datagram, routed);
+                if let Some(d) = data {
+                    assert!(
+                        peer.sent.contains(&fingerprint(&d)),
+                        "delivered a never-sent payload"
+                    );
+                }
+                if let Some(w) = reply {
+                    reply_queue.push_back(w);
                 }
             }
             Op::DropToA { pick } => {
@@ -141,30 +207,31 @@ fuzz_target!(|ops: Vec<Op>| {
             }
             Op::AdvanceMillis(ms) => mono += u64::from(ms) * 1_000_000,
             Op::AdvanceSeconds(s) => mono += u64::from(s) * 1_000_000_000,
-            Op::PollA | Op::PollB => {
-                let on_a = matches!(op, Op::PollA);
-                let (tunnel, rng, queue) = if on_a {
-                    (&mut a, &mut rng_a, &mut to_b)
+            Op::PollA => to_b.extend(a.poll_to_idle(mono)),
+            Op::PollB => to_a.extend(b.poll_to_idle(mono)),
+            Op::InitiateA | Op::InitiateB => {
+                let ep = if matches!(op, Op::InitiateA) {
+                    &mut a
                 } else {
-                    (&mut b, &mut rng_b, &mut to_a)
+                    &mut b
                 };
-                for _ in 0..4 {
-                    let mut wire = vec![0u8; 2048];
-                    match tunnel.poll(now(mono), &mut wire, rng).unwrap() {
-                        PollOutput::Send(w, _) => queue.push_back(w.to_vec()),
-                        _ => break,
-                    }
-                }
+                ep.side
+                    .tunnel
+                    .request_handshake(wireguard_sans_io::Ticks::from_nanos(mono));
+                ep.check(mono, "request_handshake");
             }
-            Op::InitiateA => {
-                let mut wire = vec![0u8; 2048];
-                if let Ok(w) = a.initiate_handshake(now(mono), &mut wire, &mut rng_a) {
-                    to_b.push_back(w.to_vec());
-                }
-            }
-            Op::ResetB => {
-                b.reset();
-                sent_a.clear(); // queued/encrypted A-payloads may now never decrypt; fine
+            Op::ResetA | Op::ResetB => {
+                let (ep, peer) = if matches!(op, Op::ResetA) {
+                    (&mut a, &mut b)
+                } else {
+                    (&mut b, &mut a)
+                };
+                ep.side.tunnel.reset();
+                ep.model.reset();
+                ep.check(mono, "reset");
+                // Payloads the peer encrypted for the wiped sessions can
+                // never be delivered now; nothing to assert about them.
+                let _ = peer;
             }
         }
         while to_a.len() > 32 {

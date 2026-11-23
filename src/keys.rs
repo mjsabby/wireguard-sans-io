@@ -7,8 +7,8 @@
 
 use core::fmt;
 
-use crate::crypto::ct;
 use crate::crypto::x25519;
+use crate::crypto::{CryptoProvider, InTree, ct};
 use crate::entropy::EntropySource;
 use crate::error::Error;
 
@@ -26,13 +26,42 @@ fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
 pub struct StaticSecret([u8; 32]);
 
 impl StaticSecret {
-    /// Generate a fresh private key.
+    /// Generate a fresh private key: 32 bytes from `rng`, clamped as RFC
+    /// 7748 §5 prescribes (which is bit masking, not a computation any
+    /// [`CryptoProvider`] would do differently).
+    ///
+    /// Nothing of the key is left behind in this function's own frames —
+    /// nor, as far as they lie on the stack beneath it, in the entropy
+    /// source's. The value itself still travels to wherever the caller
+    /// keeps it, and each move leaves the bytes where they were (see
+    /// `EMBEDDER_OBLIGATIONS.md` §10).
     ///
     /// # Errors
     /// [`Error::EntropyFailure`] if `rng` fails.
     pub fn generate(rng: &mut dyn EntropySource) -> Result<Self, Error> {
-        let bytes = rng.gen32().map_err(|_| Error::EntropyFailure)?;
-        Ok(Self(x25519::clamp_scalar(bytes)))
+        let mut scrub = ct::ScrubOnDrop::new();
+        Self::generate_by_value(rng, scrub.low())
+    }
+
+    /// [`Self::generate`]'s work, in a frame that is overwritten once the
+    /// key has been handed over.
+    #[inline(never)]
+    fn generate_by_value(rng: &mut dyn EntropySource, low: &mut usize) -> Result<Self, Error> {
+        *low = ct::stack_mark();
+        let mut generated = Ok(Self([0u8; 32]));
+        let drawn = match &mut generated {
+            Ok(secret) => {
+                let drawn = rng.fill(&mut secret.0);
+                x25519::clamp_in_place(&mut secret.0);
+                drawn
+            }
+            Err(_) => Ok(()),
+        };
+        if drawn.is_err() {
+            // Dropping what was there wipes whatever the source wrote.
+            generated = Err(Error::EntropyFailure);
+        }
+        generated
     }
 
     /// Wrap an existing 32-byte private key (e.g. from `wg genkey`).
@@ -43,14 +72,37 @@ impl StaticSecret {
         Self(bytes)
     }
 
-    /// The corresponding public key.
+    /// The corresponding public key, computed with the in-tree X25519.
+    ///
+    /// A key on its own knows no [`CryptoProvider`]. Where the scalar
+    /// multiplication has to be the provider's — the reason for having one
+    /// may be exactly that — use [`StaticSecret::public_key_with`], or
+    /// read the key from the device ([`crate::Device::public_key`], which
+    /// asks its provider).
     #[must_use]
     pub fn public_key(&self) -> PublicKey {
-        PublicKey(x25519::x25519_base(&self.0))
+        self.public_key_with::<InTree>()
+    }
+
+    /// The corresponding public key, computed by the provider `P`.
+    #[must_use]
+    pub fn public_key_with<P: CryptoProvider>(&self) -> PublicKey {
+        PublicKey(P::x25519_public(&self.0))
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// No key: what a key that is about to be [`set`](Self::set) starts
+    /// as.
+    pub(crate) const BLANK: Self = Self([0u8; 32]);
+
+    /// Make this key a copy of `other`, byte by byte and in place: the
+    /// way a key gets into a [`crate::Device`] or a [`crate::Tunnel`]
+    /// without a copy of it being made on the way.
+    pub(crate) fn set(&mut self, other: &Self) {
+        ct::copy_secret(&mut self.0, &other.0);
     }
 }
 
@@ -73,7 +125,12 @@ impl Drop for StaticSecret {
 }
 
 /// A peer's static Curve25519 public key.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// Public keys are what a peer table is keyed by (see
+/// [`crate::Device::identify`]), so they hash and order like the 32 bytes
+/// they are. None of that is constant time, and need not be: the key is
+/// public.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PublicKey([u8; 32]);
 
 impl PublicKey {
@@ -122,11 +179,35 @@ impl PresharedKey {
     /// # Errors
     /// [`Error::EntropyFailure`] if `rng` fails.
     pub fn generate(rng: &mut dyn EntropySource) -> Result<Self, Error> {
-        Ok(Self(rng.gen32().map_err(|_| Error::EntropyFailure)?))
+        // As `StaticSecret::generate`.
+        let mut scrub = ct::ScrubOnDrop::new();
+        Self::generate_by_value(rng, scrub.low())
+    }
+
+    #[inline(never)]
+    fn generate_by_value(rng: &mut dyn EntropySource, low: &mut usize) -> Result<Self, Error> {
+        *low = ct::stack_mark();
+        let mut generated = Ok(Self([0u8; 32]));
+        let drawn = match &mut generated {
+            Ok(key) => rng.fill(&mut key.0),
+            Err(_) => Ok(()),
+        };
+        if drawn.is_err() {
+            generated = Err(Error::EntropyFailure);
+        }
+        generated
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// No key (the protocol's "no PSK").
+    pub(crate) const BLANK: Self = Self([0u8; 32]);
+
+    /// Make this key a copy of `other`, byte by byte and in place.
+    pub(crate) fn set(&mut self, other: &Self) {
+        ct::copy_secret(&mut self.0, &other.0);
     }
 }
 
@@ -200,6 +281,55 @@ mod tests {
             PresharedKey::generate(&mut FailingRng).map(|_| ()),
             Err(Error::EntropyFailure)
         );
+    }
+
+    /// A source that fails after writing part of what it was asked for
+    /// gives no key — and what it wrote is not handed out.
+    #[test]
+    fn a_failed_draw_gives_no_key() {
+        struct HalfThenFail;
+        impl EntropySource for HalfThenFail {
+            fn fill(&mut self, buf: &mut [u8]) -> Result<(), crate::EntropyError> {
+                let half = buf.len() / 2;
+                for b in buf.iter_mut().take(half) {
+                    *b = 0xee;
+                }
+                Err(crate::EntropyError)
+            }
+        }
+        assert!(matches!(
+            StaticSecret::generate(&mut HalfThenFail),
+            Err(Error::EntropyFailure)
+        ));
+        assert!(matches!(
+            PresharedKey::generate(&mut HalfThenFail),
+            Err(Error::EntropyFailure)
+        ));
+    }
+
+    #[test]
+    fn generated_keys_are_clamped_and_set_copies_them() {
+        let mut rng = DeterministicRng::new(9);
+        for _ in 0..16 {
+            let secret = StaticSecret::generate(&mut rng).unwrap();
+            let bytes = *secret.as_bytes();
+            assert_eq!(bytes, x25519::clamp_scalar(bytes));
+            let mut copy = StaticSecret::BLANK;
+            copy.set(&secret);
+            assert_eq!(copy.as_bytes(), &bytes);
+        }
+        // The same bytes the source hands out, in the same order as
+        // before: 32 for a key, 32 for a pre-shared key.
+        let mut a = DeterministicRng::new(10);
+        let mut b = DeterministicRng::new(10);
+        let secret = StaticSecret::generate(&mut a).unwrap();
+        let psk = PresharedKey::generate(&mut a).unwrap();
+        let (first, second) = (b.gen32().unwrap(), b.gen32().unwrap());
+        assert_eq!(secret.as_bytes(), &x25519::clamp_scalar(first));
+        assert_eq!(psk.as_bytes(), &second);
+        let mut copy = PresharedKey::BLANK;
+        copy.set(&psk);
+        assert_eq!(copy.as_bytes(), &second);
     }
 
     #[test]

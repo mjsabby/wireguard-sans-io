@@ -95,16 +95,22 @@ pub struct SlabPool {
 
 impl SlabPool {
     /// New pool of `slab_len`-byte buffers, retaining at most `max_idle`
-    /// on the freelist.
+    /// on the freelist. (`max_idle` is a bound, not a reservation: any
+    /// value is fine, `usize::MAX` included.)
     #[must_use]
     pub fn new(slab_len: usize, max_idle: usize) -> Arc<Self> {
         Arc::new(Self {
             slab_len,
             max_idle,
-            free: Mutex::new(Vec::with_capacity(max_idle)),
+            // Room for the usual pool up front; a bigger freelist grows
+            // as buffers come back.
+            free: Mutex::new(Vec::with_capacity(max_idle.min(Self::FREELIST_RESERVE))),
             outstanding: std::sync::atomic::AtomicUsize::new(0),
         })
     }
+
+    /// Freelist entries reserved when a pool is created.
+    const FREELIST_RESERVE: usize = 256;
 
     /// Pool sized for WireGuard at a 1500-byte MTU: 2 KiB slabs, up to
     /// 256 idle (≈ one replay-window's worth of in-flight packets).
@@ -132,6 +138,26 @@ impl SlabPool {
         let storage = BufferPool::take(self.as_ref());
         PooledBuf {
             storage: Some(storage),
+            start: 0,
+            len: 0,
+            pool: Arc::clone(self),
+        }
+    }
+
+    /// As [`get`](Self::get), for contents of `len` bytes: a pooled slab
+    /// if they fit one, and otherwise a buffer of exactly that size,
+    /// allocated for the occasion and freed (not pooled) when dropped.
+    #[must_use]
+    pub fn get_sized(self: &Arc<Self>, len: usize) -> PooledBuf {
+        if len <= self.slab_len {
+            return self.get();
+        }
+        // Counted like a slab, so that giving it back balances.
+        self.outstanding
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        PooledBuf {
+            storage: Some(vec![0u8; len].into_boxed_slice()),
+            start: 0,
             len: 0,
             pool: Arc::clone(self),
         }
@@ -191,10 +217,13 @@ impl fmt::Debug for SlabPool {
 
 /// An RAII buffer checked out of a [`SlabPool`].
 ///
-/// * `Deref`/`DerefMut` to `[u8]` give the **filled prefix** (`len`
-///   bytes); use [`PooledBuf::spare_mut`] for the full backing slab when
-///   you need to write into it (e.g. as a `recv()` destination), then
-///   [`PooledBuf::set_len`] to record how much was written.
+/// * `Deref`/`DerefMut` to `[u8]` give the **filled range** (`len` bytes
+///   starting at `start`, usually 0); use [`PooledBuf::spare_mut`] for the
+///   full backing slab when you need to write into it (e.g. as a `recv()`
+///   destination), then [`PooledBuf::set_len`] to record how much was
+///   written. [`PooledBuf::set_range`] marks a range that does not begin
+///   at the start of the slab — a packet decrypted in place sits behind
+///   its 16-byte transport header.
 /// * Dropping returns the slab to the pool. The contents are **not**
 ///   wiped — the protocol layer never puts long-lived secrets in these
 ///   (transport plaintext lives here transiently, same as in any
@@ -205,7 +234,9 @@ impl fmt::Debug for SlabPool {
 ///   the `PooledBuf` outlives the operation.
 pub struct PooledBuf {
     storage: Option<Box<[u8]>>,
-    /// Filled-prefix length (`0..=slab_len`).
+    /// Start of the filled range (`0..=slab_len`).
+    start: usize,
+    /// Length of the filled range (`start + len <= slab_len`).
     len: usize,
     pool: Arc<SlabPool>,
 }
@@ -217,14 +248,22 @@ impl PooledBuf {
         self.storage.as_deref_mut().unwrap_or(&mut [])
     }
 
-    /// Record how many bytes of the slab are now valid (e.g. the return
-    /// value of `recv()`). Clamped to the slab size.
+    /// Record how many bytes of the slab are now valid, counted from its
+    /// start (e.g. the return value of `recv()`). Clamped to the slab
+    /// size.
     pub fn set_len(&mut self, len: usize) {
-        let cap = self.storage.as_deref().map_or(0, <[u8]>::len);
-        self.len = len.min(cap);
+        self.set_range(0, len);
     }
 
-    /// The filled-prefix length.
+    /// Mark `len` bytes starting at `start` as the valid range. Both are
+    /// clamped to the slab.
+    pub fn set_range(&mut self, start: usize, len: usize) {
+        let cap = self.storage.as_deref().map_or(0, <[u8]>::len);
+        self.start = start.min(cap);
+        self.len = len.min(cap.saturating_sub(self.start));
+    }
+
+    /// The filled-range length.
     #[must_use]
     pub fn len(&self) -> usize {
         self.len
@@ -242,15 +281,17 @@ impl PooledBuf {
         self.storage.as_deref().map_or(0, <[u8]>::len)
     }
 
-    /// Copy `data` into a fresh pooled buffer (queue-a-packet helper).
+    /// Copy `data` — all of it — into a buffer from `pool`
+    /// (queue-a-packet helper). Data that does not fit a slab gets a
+    /// buffer of its own size ([`SlabPool::get_sized`]); nothing is ever
+    /// cut short.
     #[must_use]
     pub fn copy_from(pool: &Arc<SlabPool>, data: &[u8]) -> Self {
-        let mut b = pool.get();
-        let n = data.len().min(b.capacity());
-        if let Some(dst) = b.spare_mut().get_mut(..n) {
-            dst.copy_from_slice(data.get(..n).unwrap_or(&[]));
+        let mut b = pool.get_sized(data.len());
+        if let Some(dst) = b.spare_mut().get_mut(..data.len()) {
+            dst.copy_from_slice(data);
         }
-        b.set_len(n);
+        b.set_len(data.len());
         b
     }
 }
@@ -260,16 +301,17 @@ impl Deref for PooledBuf {
     fn deref(&self) -> &[u8] {
         self.storage
             .as_deref()
-            .and_then(|s| s.get(..self.len))
+            .and_then(|s| s.get(self.start..self.start.saturating_add(self.len)))
             .unwrap_or(&[])
     }
 }
 
 impl DerefMut for PooledBuf {
     fn deref_mut(&mut self) -> &mut [u8] {
+        let range = self.start..self.start.saturating_add(self.len);
         self.storage
             .as_deref_mut()
-            .and_then(|s| s.get_mut(..self.len))
+            .and_then(|s| s.get_mut(range))
             .unwrap_or(&mut [])
     }
 }
@@ -341,6 +383,18 @@ mod tests {
         assert_eq!(&*b, b"hello");
         b.set_len(1000);
         assert_eq!(b.len(), 32, "clamped to capacity");
+        // A range that does not start at the front of the slab.
+        b.spare_mut()[16..21].copy_from_slice(b"world");
+        b.set_range(16, 5);
+        assert_eq!(&*b, b"world");
+        assert_eq!(b.len(), 5);
+        b.set_range(30, 100);
+        assert_eq!(b.len(), 2, "range clamped to the slab");
+        b.set_range(100, 4);
+        assert!(b.is_empty(), "start clamped to the slab");
+        // set_len goes back to a prefix.
+        b.set_len(5);
+        assert_eq!(&*b, b"hello");
     }
 
     #[test]
@@ -348,6 +402,48 @@ mod tests {
         let pool = SlabPool::new(32, 4);
         let b = PooledBuf::copy_from(&pool, b"wireguard");
         assert_eq!(&*b, b"wireguard");
+    }
+
+    /// A packet bigger than a slab is copied whole — into a buffer of its
+    /// own, which is not pooled — and the pool's accounting stays right.
+    /// (It used to be cut down to the slab size without a word.)
+    #[test]
+    fn copy_from_never_truncates() {
+        let pool = SlabPool::new(64, 4);
+        for len in [0usize, 1, 63, 64, 65, 3000, 70_000] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let b = PooledBuf::copy_from(&pool, &data);
+            assert_eq!(&b[..], &data[..], "len {len}");
+            assert_eq!(b.capacity(), len.max(64));
+            assert_eq!(pool.outstanding(), 1);
+            let idle_before = pool.idle();
+            drop(b);
+            assert_eq!(pool.outstanding(), 0, "len {len}");
+            // Only real slabs come back to the freelist.
+            assert_eq!(
+                pool.idle(),
+                idle_before + usize::from(len <= 64),
+                "len {len}"
+            );
+        }
+        assert_eq!(pool.idle(), 1, "one slab, reused throughout");
+        assert_eq!(pool.get_sized(65).capacity(), 65);
+        assert_eq!(pool.get_sized(64).capacity(), 64);
+    }
+
+    /// The freelist bound is a bound: nothing of that size is reserved,
+    /// so even "unbounded" neither panics nor allocates.
+    #[test]
+    fn any_freelist_bound_is_safe() {
+        for max_idle in [0usize, 1, 1 << 20, usize::MAX] {
+            let pool = SlabPool::new(128, max_idle);
+            let a = pool.get();
+            let b = pool.get();
+            drop((a, b));
+            assert_eq!(pool.idle(), max_idle.min(2));
+            pool.prefill(3);
+            assert_eq!(pool.idle(), max_idle.min(3));
+        }
     }
 
     #[test]

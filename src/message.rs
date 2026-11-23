@@ -3,13 +3,17 @@
 //!
 //! Parsing is strict — exact lengths for the fixed-size handshake
 //! messages, minimum length for transport data, and the three reserved
-//! bytes must be zero — and total: every input either parses or returns
-//! [`Error::InvalidPacket`]; nothing panics, nothing is copied.
+//! bytes must be zero — and total: every input either parses or is
+//! [`DropReason::Malformed`]; nothing panics, nothing is copied.
 
-use crate::Error;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use crate::consts::{
-    COOKIE_REPLY_LEN, HANDSHAKE_INITIATION_LEN, HANDSHAKE_RESPONSE_LEN, TRANSPORT_OVERHEAD,
+    COOKIE_REPLY_LEN, HANDSHAKE_INITIATION_LEN, HANDSHAKE_RESPONSE_LEN, TRANSPORT_HEADER_LEN,
+    TRANSPORT_OVERHEAD,
 };
+use crate::debug::debug_struct;
+use crate::error::{DropReason, Error};
 
 /// Message type byte of a handshake initiation.
 pub const TYPE_HANDSHAKE_INITIATION: u8 = 1;
@@ -25,7 +29,6 @@ const INIT_ALPHA_LEN: usize = HANDSHAKE_INITIATION_LEN - 32;
 const RESP_ALPHA_LEN: usize = HANDSHAKE_RESPONSE_LEN - 32;
 
 /// A parsed handshake initiation (type 1, 148 bytes).
-#[derive(Debug)]
 pub struct HandshakeInitiation<'a> {
     /// The initiator's session index (`I_i`).
     pub sender_index: u32,
@@ -45,8 +48,18 @@ pub struct HandshakeInitiation<'a> {
     pub beta: &'a [u8],
 }
 
+debug_struct!(HandshakeInitiation<'a> {
+    sender_index,
+    ephemeral,
+    encrypted_static,
+    encrypted_timestamp,
+    mac1,
+    mac2,
+    alpha,
+    beta,
+});
+
 /// A parsed handshake response (type 2, 92 bytes).
-#[derive(Debug)]
 pub struct HandshakeResponse<'a> {
     /// The responder's session index (`I_r`).
     pub sender_index: u32,
@@ -65,6 +78,17 @@ pub struct HandshakeResponse<'a> {
     /// All bytes before `mac2`.
     pub beta: &'a [u8],
 }
+
+debug_struct!(HandshakeResponse<'a> {
+    sender_index,
+    receiver_index,
+    ephemeral,
+    encrypted_nothing,
+    mac1,
+    mac2,
+    alpha,
+    beta,
+});
 
 /// A parsed cookie reply (type 3, 64 bytes).
 #[derive(Debug)]
@@ -101,10 +125,10 @@ pub enum Packet<'a> {
     TransportData(TransportData<'a>),
 }
 
-/// Split off a fixed-size chunk, mapping failure to `InvalidPacket`.
+/// Split off a fixed-size chunk, mapping failure to `Malformed`.
 #[inline]
-fn take<const N: usize>(bytes: &[u8]) -> Result<(&[u8; N], &[u8]), Error> {
-    bytes.split_first_chunk::<N>().ok_or(Error::InvalidPacket)
+fn take<const N: usize>(bytes: &[u8]) -> Result<(&[u8; N], &[u8]), DropReason> {
+    bytes.split_first_chunk::<N>().ok_or(DropReason::Malformed)
 }
 
 fn le_u32(bytes: &[u8; 4]) -> u32 {
@@ -114,22 +138,24 @@ fn le_u32(bytes: &[u8; 4]) -> u32 {
 /// Parse a datagram into a typed view. Borrow-only, total, strict.
 ///
 /// # Errors
-/// [`Error::InvalidPacket`] for anything that is not a structurally valid
+/// [`DropReason::Malformed`] for anything that is not a structurally valid
 /// WireGuard message.
-pub fn parse(datagram: &[u8]) -> Result<Packet<'_>, Error> {
+pub fn parse(datagram: &[u8]) -> Result<Packet<'_>, DropReason> {
     let (type_word, _) = take::<4>(datagram)?;
     // The first four bytes read as a little-endian u32 must equal the type
     // byte: the three reserved bytes are required to be zero.
     match le_u32(type_word) {
         t if t == u32::from(TYPE_HANDSHAKE_INITIATION) => {
             if datagram.len() != HANDSHAKE_INITIATION_LEN {
-                return Err(Error::InvalidPacket);
+                return Err(DropReason::Malformed);
             }
-            let alpha = datagram.get(..INIT_ALPHA_LEN).ok_or(Error::InvalidPacket)?;
+            let alpha = datagram
+                .get(..INIT_ALPHA_LEN)
+                .ok_or(DropReason::Malformed)?;
             let beta = datagram
                 .get(..INIT_ALPHA_LEN + 16)
-                .ok_or(Error::InvalidPacket)?;
-            let rest = datagram.get(4..).ok_or(Error::InvalidPacket)?;
+                .ok_or(DropReason::Malformed)?;
+            let rest = datagram.get(4..).ok_or(DropReason::Malformed)?;
             let (sender, rest) = take::<4>(rest)?;
             let (ephemeral, rest) = take::<32>(rest)?;
             let (encrypted_static, rest) = take::<48>(rest)?;
@@ -137,7 +163,7 @@ pub fn parse(datagram: &[u8]) -> Result<Packet<'_>, Error> {
             let (mac1, rest) = take::<16>(rest)?;
             let (mac2, rest) = take::<16>(rest)?;
             if !rest.is_empty() {
-                return Err(Error::Internal); // unreachable: length checked
+                return Err(DropReason::Malformed); // unreachable: length checked
             }
             Ok(Packet::HandshakeInitiation(HandshakeInitiation {
                 sender_index: le_u32(sender),
@@ -152,13 +178,15 @@ pub fn parse(datagram: &[u8]) -> Result<Packet<'_>, Error> {
         }
         t if t == u32::from(TYPE_HANDSHAKE_RESPONSE) => {
             if datagram.len() != HANDSHAKE_RESPONSE_LEN {
-                return Err(Error::InvalidPacket);
+                return Err(DropReason::Malformed);
             }
-            let alpha = datagram.get(..RESP_ALPHA_LEN).ok_or(Error::InvalidPacket)?;
+            let alpha = datagram
+                .get(..RESP_ALPHA_LEN)
+                .ok_or(DropReason::Malformed)?;
             let beta = datagram
                 .get(..RESP_ALPHA_LEN + 16)
-                .ok_or(Error::InvalidPacket)?;
-            let rest = datagram.get(4..).ok_or(Error::InvalidPacket)?;
+                .ok_or(DropReason::Malformed)?;
+            let rest = datagram.get(4..).ok_or(DropReason::Malformed)?;
             let (sender, rest) = take::<4>(rest)?;
             let (receiver, rest) = take::<4>(rest)?;
             let (ephemeral, rest) = take::<32>(rest)?;
@@ -166,7 +194,7 @@ pub fn parse(datagram: &[u8]) -> Result<Packet<'_>, Error> {
             let (mac1, rest) = take::<16>(rest)?;
             let (mac2, rest) = take::<16>(rest)?;
             if !rest.is_empty() {
-                return Err(Error::Internal);
+                return Err(DropReason::Malformed);
             }
             Ok(Packet::HandshakeResponse(HandshakeResponse {
                 sender_index: le_u32(sender),
@@ -181,14 +209,14 @@ pub fn parse(datagram: &[u8]) -> Result<Packet<'_>, Error> {
         }
         t if t == u32::from(TYPE_COOKIE_REPLY) => {
             if datagram.len() != COOKIE_REPLY_LEN {
-                return Err(Error::InvalidPacket);
+                return Err(DropReason::Malformed);
             }
-            let rest = datagram.get(4..).ok_or(Error::InvalidPacket)?;
+            let rest = datagram.get(4..).ok_or(DropReason::Malformed)?;
             let (receiver, rest) = take::<4>(rest)?;
             let (nonce, rest) = take::<24>(rest)?;
             let (encrypted_cookie, rest) = take::<32>(rest)?;
             if !rest.is_empty() {
-                return Err(Error::Internal);
+                return Err(DropReason::Malformed);
             }
             Ok(Packet::CookieReply(CookieReply {
                 receiver_index: le_u32(receiver),
@@ -198,9 +226,9 @@ pub fn parse(datagram: &[u8]) -> Result<Packet<'_>, Error> {
         }
         t if t == u32::from(TYPE_TRANSPORT_DATA) => {
             if datagram.len() < TRANSPORT_OVERHEAD {
-                return Err(Error::InvalidPacket);
+                return Err(DropReason::Malformed);
             }
-            let rest = datagram.get(4..).ok_or(Error::InvalidPacket)?;
+            let rest = datagram.get(4..).ok_or(DropReason::Malformed)?;
             let (receiver, rest) = take::<4>(rest)?;
             let (counter, ciphertext) = take::<8>(rest)?;
             Ok(Packet::TransportData(TransportData {
@@ -209,34 +237,54 @@ pub fn parse(datagram: &[u8]) -> Result<Packet<'_>, Error> {
                 ciphertext,
             }))
         }
-        _ => Err(Error::InvalidPacket),
+        _ => Err(DropReason::Malformed),
     }
 }
 
-/// A cheap routing summary of a datagram, for callers that manage many
-/// peers and need to demultiplex before involving any [`crate::Tunnel`].
+/// A cheap classification of a datagram: its type and the fields that are
+/// readable without any key.
+///
+/// Routing is [`crate::Device::receive`]'s job; this is for callers that
+/// want to look at a datagram before that — to tell handshake messages
+/// from data when choosing a queue or a thread, say, or for a trace.
+///
+/// What it says is the sender's claim and nothing more: the type byte and
+/// the index are whatever was written into the datagram, by anyone. So it
+/// is **not** the place for the two things it may look made for:
+///
+/// * *Counting handshake messages for the load signal.* A sender with no
+///   key at all can produce any number of them; counted here, they put
+///   the device under load at will. Count what has passed `mac1` — an
+///   [`crate::Incoming::Initiation`], a handshake
+///   [`crate::Incoming::ForPeer`] — as `EMBEDDER_OBLIGATIONS.md` §3.1
+///   describes.
+/// * *Limiting by source address.* Before the MAC checks a source address
+///   is the sender's choice as well; a limit applied here lets anyone lock
+///   a peer out by sending in its name. The place for it is after a
+///   cookie has proven the address ([`crate::Initiation::source_verified`],
+///   §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketKind {
-    /// Handshake initiation: route by trying configured peers (the inner
-    /// static key is only revealed by processing it).
+    /// Handshake initiation. The initiator's identity is encrypted inside;
+    /// [`crate::Device::receive`] decrypts it.
     HandshakeInitiation {
         /// The initiator's chosen session index.
         sender_index: u32,
     },
-    /// Handshake response: route to the tunnel whose in-flight initiation
-    /// used `receiver_index`.
+    /// Handshake response to an initiation of ours that used
+    /// `receiver_index`.
     HandshakeResponse {
         /// The responder's session index.
         sender_index: u32,
         /// Our in-flight handshake index.
         receiver_index: u32,
     },
-    /// Cookie reply: route like a response.
+    /// Cookie reply to a handshake message of ours.
     CookieReply {
         /// Our handshake/session index.
         receiver_index: u32,
     },
-    /// Transport data: route to the tunnel owning `receiver_index`.
+    /// Transport data for the session with our index `receiver_index`.
     TransportData {
         /// Our session index.
         receiver_index: u32,
@@ -248,8 +296,8 @@ pub enum PacketKind {
 /// Classify a datagram without copying or verifying anything.
 ///
 /// # Errors
-/// [`Error::InvalidPacket`] as for [`parse`].
-pub fn peek(datagram: &[u8]) -> Result<PacketKind, Error> {
+/// [`DropReason::Malformed`] as for [`parse`].
+pub fn peek(datagram: &[u8]) -> Result<PacketKind, DropReason> {
     Ok(match parse(datagram)? {
         Packet::HandshakeInitiation(m) => PacketKind::HandshakeInitiation {
             sender_index: m.sender_index,
@@ -368,7 +416,7 @@ pub fn write_transport_header(
     receiver_index: u32,
     counter: u64,
 ) -> Result<(), Error> {
-    if out.len() < TRANSPORT_OVERHEAD {
+    if out.len() < TRANSPORT_HEADER_LEN {
         return Err(Error::BufferTooSmall);
     }
     write_header(out, TYPE_TRANSPORT_DATA)?;
@@ -385,11 +433,12 @@ pub fn write_transport_header(
 /// response (92) messages.
 ///
 /// # Errors
-/// [`Error::InvalidPacket`] if `msg` is not handshake-message sized.
+/// [`Error::BufferTooSmall`] if `msg` is not exactly handshake-message
+/// sized (148 or 92 bytes).
 pub fn mac_slots(msg: &mut [u8]) -> Result<MacSlots<'_>, Error> {
     let len = msg.len();
     if len != HANDSHAKE_INITIATION_LEN && len != HANDSHAKE_RESPONSE_LEN {
-        return Err(Error::InvalidPacket);
+        return Err(Error::BufferTooSmall);
     }
     let beta_len = len.checked_sub(16).ok_or(Error::Internal)?;
     let alpha_len = len.checked_sub(32).ok_or(Error::Internal)?;
@@ -448,6 +497,44 @@ pub fn ip_packet_len(payload: &[u8]) -> Option<usize> {
         _ => return None,
     };
     (claimed <= payload.len()).then_some(claimed)
+}
+
+/// The `(source, destination)` addresses of the IP packet at the start of
+/// a payload — the two things cryptokey routing (WireGuard's "allowed
+/// IPs", whitepaper §2) looks at, and which this library leaves to the
+/// embedder:
+///
+/// * a packet **received** from a peer is only to be passed on if its
+///   *source* is an address that peer may use — otherwise any peer can
+///   send packets in the name of any other;
+/// * a packet **to be sent** goes to the peer whose allowed addresses
+///   contain its *destination*.
+///
+/// `None` exactly when [`ip_packet_len`] is: the bytes are not a
+/// self-consistent IPv4 or IPv6 header. Such a payload has no addresses
+/// to check and should not be forwarded.
+#[must_use]
+pub fn ip_packet_addresses(payload: &[u8]) -> Option<(IpAddr, IpAddr)> {
+    ip_packet_len(payload)?;
+    match payload.first()? >> 4 {
+        4 => {
+            let (source, rest) = payload.get(12..)?.split_first_chunk::<4>()?;
+            let (destination, _) = rest.split_first_chunk::<4>()?;
+            Some((
+                IpAddr::V4(Ipv4Addr::from(*source)),
+                IpAddr::V4(Ipv4Addr::from(*destination)),
+            ))
+        }
+        6 => {
+            let (source, rest) = payload.get(8..)?.split_first_chunk::<16>()?;
+            let (destination, _) = rest.split_first_chunk::<16>()?;
+            Some((
+                IpAddr::V6(Ipv6Addr::from(*source)),
+                IpAddr::V6(Ipv6Addr::from(*destination)),
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -538,7 +625,7 @@ mod tests {
         }
         // Exactly 32 bytes (keepalive) parses; 31 does not.
         assert!(parse(&out[..32]).is_ok());
-        assert!(matches!(parse(&out[..31]), Err(Error::InvalidPacket)));
+        assert!(matches!(parse(&out[..31]), Err(DropReason::Malformed)));
     }
 
     #[test]
@@ -546,7 +633,7 @@ mod tests {
         for byte in 1..4 {
             let mut buf = valid_initiation();
             buf[byte] = 1;
-            assert!(matches!(parse(&buf), Err(Error::InvalidPacket)), "{byte}");
+            assert!(matches!(parse(&buf), Err(DropReason::Malformed)), "{byte}");
         }
     }
 
@@ -555,7 +642,7 @@ mod tests {
         for t in [0u8, 5, 6, 100, 255] {
             let mut buf = valid_initiation();
             buf[0] = t;
-            assert!(matches!(parse(&buf), Err(Error::InvalidPacket)), "{t}");
+            assert!(matches!(parse(&buf), Err(DropReason::Malformed)), "{t}");
         }
     }
 
@@ -564,24 +651,24 @@ mod tests {
         let init = valid_initiation();
         for keep in 0..init.len() {
             assert!(
-                matches!(parse(&init[..keep]), Err(Error::InvalidPacket)),
+                matches!(parse(&init[..keep]), Err(DropReason::Malformed)),
                 "truncation to {keep}"
             );
         }
         let mut extended = init.clone();
         extended.push(0);
-        assert!(matches!(parse(&extended), Err(Error::InvalidPacket)));
+        assert!(matches!(parse(&extended), Err(DropReason::Malformed)));
 
         let mut resp = vec![0u8; HANDSHAKE_RESPONSE_LEN];
         build_response(&mut resp, 1, 2, &[0; 32], &[0; 16]).unwrap();
         for keep in 0..resp.len() {
-            assert!(matches!(parse(&resp[..keep]), Err(Error::InvalidPacket)));
+            assert!(matches!(parse(&resp[..keep]), Err(DropReason::Malformed)));
         }
 
         let mut cookie = vec![0u8; COOKIE_REPLY_LEN];
         build_cookie_reply(&mut cookie, 1, &[0; 24], &[0; 32]).unwrap();
         for keep in 0..cookie.len() {
-            assert!(matches!(parse(&cookie[..keep]), Err(Error::InvalidPacket)));
+            assert!(matches!(parse(&cookie[..keep]), Err(DropReason::Malformed)));
         }
     }
 
@@ -604,6 +691,61 @@ mod tests {
             write_transport_header(&mut tiny, 0, 0),
             Err(Error::BufferTooSmall)
         ));
+    }
+
+    #[test]
+    fn ip_packet_addresses_reads_source_and_destination() {
+        // IPv4: 192.0.2.1 → 198.51.100.7, with padding after the packet.
+        let mut v4 = vec![0u8; 32];
+        v4[0] = 0x45;
+        v4[2..4].copy_from_slice(&20u16.to_be_bytes());
+        v4[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        v4[16..20].copy_from_slice(&[198, 51, 100, 7]);
+        assert_eq!(
+            ip_packet_addresses(&v4),
+            Some((
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))
+            ))
+        );
+        // With options (IHL 6) the addresses are where they always are.
+        v4[0] = 0x46;
+        v4[2..4].copy_from_slice(&24u16.to_be_bytes());
+        assert!(
+            matches!(ip_packet_addresses(&v4), Some((IpAddr::V4(s), _)) if s.octets() == [192, 0, 2, 1])
+        );
+
+        // IPv6: 2001:db8::1 → 2001:db8::2.
+        let mut v6 = vec![0u8; 48];
+        v6[0] = 0x60;
+        v6[4..6].copy_from_slice(&8u16.to_be_bytes());
+        v6[8..10].copy_from_slice(&[0x20, 0x01]);
+        v6[10..12].copy_from_slice(&[0x0d, 0xb8]);
+        v6[23] = 1;
+        v6[24..28].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
+        v6[39] = 2;
+        let expected = (
+            IpAddr::V6("2001:db8::1".parse().unwrap()),
+            IpAddr::V6("2001:db8::2".parse().unwrap()),
+        );
+        assert_eq!(ip_packet_addresses(&v6), Some(expected));
+
+        // Whatever `ip_packet_len` does not accept has no addresses: a
+        // header that lies about its length, a truncated one, something
+        // that is not IP.
+        v4[2..4].copy_from_slice(&1000u16.to_be_bytes());
+        assert_eq!(ip_packet_addresses(&v4), None);
+        assert_eq!(ip_packet_addresses(&v6[..39]), None);
+        assert_eq!(ip_packet_addresses(&[0x70; 64]), None);
+        assert_eq!(ip_packet_addresses(&[]), None);
+        // The two agree on every prefix of a valid packet.
+        for cut in 0..v6.len() {
+            assert_eq!(
+                ip_packet_addresses(&v6[..cut]).is_some(),
+                ip_packet_len(&v6[..cut]).is_some(),
+                "cut {cut}"
+            );
+        }
     }
 
     #[test]
@@ -682,7 +824,7 @@ mod tests {
         let mut not_handshake = vec![0u8; 64];
         assert!(matches!(
             mac_slots(&mut not_handshake),
-            Err(Error::InvalidPacket)
+            Err(Error::BufferTooSmall)
         ));
     }
 }

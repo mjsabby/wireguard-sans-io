@@ -1,6 +1,12 @@
 #!/bin/bash
-# Set up a kernel WireGuard interface and print the parameters needed for
-# the interop example to connect. Run as root in WSL.
+# Set up a kernel WireGuard interface and print the parameters the
+# `interop_kernel` example needs to connect to it from another machine.
+# Run as root on the Linux side (the last lines assume the interface
+# towards the other machine is eth0, as in WSL).
+#
+#   scripts/interop_kernel.sh <client private key, base64> [pre-shared key]
+#
+# For both roles on one machine without root, see scripts/interop_netns.sh.
 set -euo pipefail
 
 DEV=wgtest

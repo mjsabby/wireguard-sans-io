@@ -8,18 +8,34 @@
 //! Rotations: 16-bit via `vrev32q_u16` (free byte-swap), 8-bit via
 //! `vqtbl1q_u8`, 12/7-bit via `vsli`+`vshr` (shift-left-and-insert).
 //!
+//! # What is left behind
+//!
+//! Nothing that is the key or the keystream: the key words unpacked
+//! here and the stack buffer the keystream goes through are zeroed
+//! before a call returns, and so is the kernel's whole stack frame,
+//! where the compiler parks registers it has no room for — its caller
+//! overwrites it after the last stride (`clear_frames`, see the crate
+//! documentation).
+//!
 //! # Safety
 //!
 //! Every `unsafe` block is a `core::arch::aarch64` intrinsic call. NEON
 //! is architecturally guaranteed on AArch64, so the only obligation is
 //! "don't read/write out of bounds" — and the only memory ops are
-//! `vst1q_u8` into a local `[u8; 256]` at fixed offsets 0, 16, …, 240.
+//! `vst1q_u8` into the `[u8; 256]` the kernel is handed by reference, at
+//! fixed offsets 0, 16, …, 240.
 
 #![allow(unsafe_code)]
 
 use core::arch::aarch64::*;
 
-use crate::{ChaChaImpl, SIGMA, Scalar, key_words, nonce_words, xor_tail};
+use wireguard_sans_io::crypto::ct;
+
+use crate::{ChaChaImpl, SIGMA, Scalar, clear_frames, load_key_words, nonce_words, xor_tail};
+
+/// What [`clear_frames`] overwrites at once after the kernel, in 64-bit
+/// words.
+const KERNEL_FRAME: usize = 112;
 
 /// NEON 4-block-parallel ChaCha20.
 ///
@@ -36,36 +52,57 @@ pub struct Neon;
 impl ChaChaImpl for Neon {
     #[inline]
     fn apply_keystream(key: &[u8; 32], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
-        let kw = key_words(key);
+        let mut kw = [0u32; 8];
+        load_key_words(key, &mut kw);
         let nw = nonce_words(nonce);
         let mut ctr = counter;
+        // How far down the kernel's frame went (see `clear_frames`).
+        let mut low = usize::MAX;
+        // One buffer for every stride: it holds keystream, and is wiped
+        // once at the end.
+        let mut ks = [0u8; 256];
         let mut chunks = buf.chunks_exact_mut(256);
         for chunk in &mut chunks {
             // SAFETY: NEON is mandatory on AArch64.
-            let ks = unsafe { four_blocks(&kw, &nw, ctr) };
+            low = low.min(unsafe { four_blocks(&kw, &nw, ctr, &mut ks) });
             xor_tail(chunk, &ks);
             ctr = ctr.wrapping_add(4);
         }
         let tail = chunks.into_remainder();
         if tail.len() >= 64 {
             // SAFETY: NEON is mandatory on AArch64.
-            let ks = unsafe { four_blocks(&kw, &nw, ctr) };
+            low = low.min(unsafe { four_blocks(&kw, &nw, ctr, &mut ks) });
             xor_tail(tail, &ks);
         } else if !tail.is_empty() {
             Scalar::apply_keystream(key, nonce, ctr, tail);
         }
+        ct::wipe_array(&mut ks);
+        ct::wipe_words(&mut kw);
+        clear_frames::<KERNEL_FRAME>(low);
     }
     fn name() -> &'static str {
         "neon-4way"
     }
 }
 
+/// Four keystream blocks, starting at block `ctr`, written to `out`.
+///
+/// Returns where the stack ends beneath this function's frame
+/// ([`ct::stack_mark`]). The frame holds whatever registers the compiler
+/// parked during the rounds; the caller overwrites it when it is done
+/// with the kernel ([`clear_frames`]), which is why this is never
+/// inlined: the frame has to be one of its own.
+///
 /// # Safety
 /// NEON is mandatory on AArch64; the caller need only be on aarch64
-/// (enforced by `cfg`). All stores are to a local `[u8; 256]`.
+/// (enforced by `cfg`). All stores are to `out`.
 #[target_feature(enable = "neon")]
+#[inline(never)]
 #[allow(clippy::multiple_unsafe_ops_per_block)] // every line is an intrinsic
-unsafe fn four_blocks(key: &[u32; 8], nonce: &[u32; 3], ctr: u32) -> [u8; 256] {
+unsafe fn four_blocks(key: &[u32; 8], nonce: &[u32; 3], ctr: u32, out: &mut [u8; 256]) -> usize {
+    // Taken before anything is in a vector register: a call in the
+    // middle would have all of them saved around it.
+    let low = ct::stack_mark();
     // SAFETY: every intrinsic below is NEON (mandatory on AArch64);
     // every `vst1q_u8` targets `out` at a fixed in-bounds offset.
     unsafe {
@@ -184,7 +221,6 @@ unsafe fn four_blocks(key: &[u32; 8], nonce: &[u32; 3], ctr: u32) -> [u8; 256] {
         transpose4!(x8, x9, x10, x11);
         transpose4!(x12, x13, x14, x15);
 
-        let mut out = [0u8; 256];
         let p = out.as_mut_ptr();
         macro_rules! store {
             ($off:expr, $v:expr) => {
@@ -207,6 +243,6 @@ unsafe fn four_blocks(key: &[u32; 8], nonce: &[u32; 3], ctr: u32) -> [u8; 256] {
         store!(208, x7);
         store!(224, x11);
         store!(240, x15);
-        out
     }
+    low
 }

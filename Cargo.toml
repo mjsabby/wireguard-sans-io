@@ -9,6 +9,11 @@ keywords = ["wireguard", "noise", "sans-io", "no-std", "vpn"]
 categories = ["network-programming", "cryptography", "no-std", "no-std::no-alloc"]
 repository = "https://github.com/mjsabby/wireguard-sans-io"
 readme = "README.md"
+# A published package is the library with its tests and examples and the
+# two documents. What drives the rest of the repository stays there: the
+# CI workflow, the scripts (they need the other crates, a kernel, qemu)
+# and the build configuration.
+exclude = [".github/", ".cargo/", "scripts/", ".gitignore"]
 
 # Workspace: the no_std core (this package) plus the std-driving wrapper
 # and the SIMD backends. The fuzz harness and the comparative benchmark
@@ -18,6 +23,14 @@ readme = "README.md"
 [workspace]
 members = ["embed", "simd"]
 exclude = ["fuzz", "bench"]
+
+[features]
+default = ["x25519-table"]
+# Key generation (the public key of a private key, once per handshake
+# message) with a ladder made for the base point: about 40 % cheaper than
+# the general one, for 10 KiB of constants. Constant time either way.
+# Leave it out where 10 KiB of flash matter more.
+x25519-table = []
 
 [dependencies]
 # none, ever. The entire implementation (including all cryptography) is
@@ -66,6 +79,10 @@ string_slice = "deny"
 arithmetic_side_effects = "deny"
 modulo_one = "deny"
 exit = "deny"
+# The slice methods that carry a panic (`clippy.toml` lists them) are an
+# error in the library — `src/lib.rs` says so, where it applies — and
+# allowed in its tests and examples, which is what this line is for.
+disallowed_methods = "allow"
 # ---- general hygiene ----------------------------------------------------
 mem_forget = "deny"
 dbg_macro = "deny"

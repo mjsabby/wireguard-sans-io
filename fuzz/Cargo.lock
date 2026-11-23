@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "wireguard-sans-io"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "wireguard-sans-io-fuzz"

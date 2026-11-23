@@ -1,0 +1,35 @@
+# Methods that panic for arguments the compiler cannot always see through:
+# a split point past the end, lengths that differ, a chunk size or a step
+# of zero. Not one of them could fire with the constant shapes this
+# library would use them with — but at lower optimisation levels the
+# check, and the panic behind it, stay in the machine code, and "no panic
+# machinery in the image" (scripts/check_no_panic.sh) would hold for some
+# builds and not for others. The library is written without them
+# (`src/crypto/bytes.rs` has what it uses instead), and `src/lib.rs` turns
+# this lint into an error for the library itself. Tests and examples may
+# use what they like.
+#
+# (The other crates of the repository are not held to this: each has a
+# `clippy.toml` of its own, which is where clippy stops looking.)
+disallowed-methods = [
+    { path = "slice::split_at", reason = "panics if the split point is past the end: use `split_at_checked` or `split_first_chunk`" },
+    { path = "slice::split_at_mut", reason = "panics if the split point is past the end: use `split_at_mut_checked` or `split_first_chunk_mut`" },
+    { path = "slice::copy_from_slice", reason = "panics if the lengths differ: use `crypto::bytes::copy`, or assign an array" },
+    { path = "slice::clone_from_slice", reason = "panics if the lengths differ" },
+    { path = "slice::copy_within", reason = "panics if the range or the destination is out of bounds" },
+    { path = "slice::swap", reason = "panics if an index is out of bounds: use `core::mem::swap` on two elements" },
+    { path = "slice::swap_with_slice", reason = "panics if the lengths differ" },
+    { path = "slice::rotate_left", reason = "panics if the count is larger than the length" },
+    { path = "slice::rotate_right", reason = "panics if the count is larger than the length" },
+    { path = "slice::chunks", reason = "panics for a chunk size of zero: use `split_first_chunk` in a loop" },
+    { path = "slice::chunks_mut", reason = "panics for a chunk size of zero: use `split_first_chunk_mut` in a loop" },
+    { path = "slice::chunks_exact", reason = "panics for a chunk size of zero: use `split_first_chunk` in a loop" },
+    { path = "slice::chunks_exact_mut", reason = "panics for a chunk size of zero: use `split_first_chunk_mut` in a loop" },
+    { path = "slice::rchunks", reason = "panics for a chunk size of zero" },
+    { path = "slice::rchunks_mut", reason = "panics for a chunk size of zero" },
+    { path = "slice::rchunks_exact", reason = "panics for a chunk size of zero" },
+    { path = "slice::rchunks_exact_mut", reason = "panics for a chunk size of zero" },
+    { path = "slice::windows", reason = "panics for a window size of zero" },
+    { path = "str::split_at", reason = "panics if the split point is not on a character boundary" },
+    { path = "core::iter::Iterator::step_by", reason = "panics for a step of zero" },
+]

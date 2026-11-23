@@ -23,9 +23,13 @@ impl DeterministicRng {
     /// Create a generator whose entire output is determined by `seed`.
     #[must_use]
     pub fn new(seed: u64) -> Self {
+        let [k0, k1, k2, k3] = [1u64, 2, 3, 4].map(|i| seed.wrapping_mul(i).to_le_bytes());
         let mut key = [0u8; 32];
-        for (chunk, i) in key.chunks_exact_mut(8).zip(1u64..) {
-            chunk.copy_from_slice(&seed.wrapping_mul(i).to_le_bytes());
+        for (k, b) in key
+            .iter_mut()
+            .zip(k0.iter().chain(&k1).chain(&k2).chain(&k3))
+        {
+            *k = *b;
         }
         Self {
             key,

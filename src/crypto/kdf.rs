@@ -6,6 +6,7 @@
 
 use crate::crypto::blake2s::Blake2s256;
 use crate::crypto::ct;
+use crate::crypto::provider::{CryptoProvider, InTree};
 
 /// BLAKE2s block size, the HMAC padding width.
 const BLOCK: usize = 64;
@@ -14,16 +15,32 @@ const BLOCK: usize = 64;
 ///
 /// All protocol keys are 32 bytes; keys longer than the 64-byte block are
 /// hashed first (defensive totality, the protocol never hits that branch).
+///
+/// The result comes back by value — a convenience for tests and for
+/// results that are public. Where it is a secret, use [`hmac_into`] (see
+/// the notes on what a call leaves behind in [`crate::crypto`]).
 #[must_use]
 pub fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    hmac_into(key, parts, &mut out);
+    out
+}
+
+/// As [`hmac`], writing the result to `out`. Every `Kdf_n` output is
+/// secret, so the protocol code uses this form: nothing is returned by
+/// value, and the padded key blocks and both hash states are wiped before
+/// returning.
+pub fn hmac_into(key: &[u8], parts: &[&[u8]], out: &mut [u8; 32]) {
     let mut k_block = [0u8; BLOCK];
     if key.len() > BLOCK {
         let mut h = Blake2s256::new();
         h.update(key);
-        let digest = h.finalize();
+        let mut digest = [0u8; 32];
+        h.finalize_into(&mut digest);
         for (d, s) in k_block.iter_mut().zip(digest.iter()) {
             *d = *s;
         }
+        ct::wipe_array(&mut digest);
     } else {
         for (d, s) in k_block.iter_mut().zip(key.iter()) {
             *d = *s;
@@ -42,48 +59,93 @@ pub fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     for part in parts {
         inner.update(part);
     }
-    let mut inner_digest = inner.finalize();
+    let mut inner_digest = [0u8; 32];
+    inner.finalize_into(&mut inner_digest);
 
     let mut outer = Blake2s256::new();
     outer.update(&opad);
     outer.update(&inner_digest);
-    let out = outer.finalize();
+    outer.finalize_into(out);
 
     ct::wipe(&mut k_block);
     ct::wipe(&mut ipad);
     ct::wipe(&mut opad);
     ct::wipe_array(&mut inner_digest);
-    out
 }
 
 /// `Kdf1(key, input)` (whitepaper §5.4): returns `τ1`.
+///
+/// This and its two siblings return key material by value, which is a
+/// convenience for tests and nothing the protocol code does: use
+/// [`kdf_into`] or [`kdf_chain`], which write each output where it is
+/// used from.
 #[must_use]
 pub fn kdf1(key: &[u8; 32], input: &[u8]) -> [u8; 32] {
-    let mut t0 = hmac(key, &[input]);
-    let t1 = hmac(&t0, &[&[0x01]]);
-    ct::wipe_array(&mut t0);
+    let mut t1 = [0u8; 32];
+    kdf_into::<InTree, 1>(key, input, [&mut t1]);
     t1
 }
 
 /// `Kdf2(key, input)`: returns `(τ1, τ2)`.
 #[must_use]
 pub fn kdf2(key: &[u8; 32], input: &[u8]) -> ([u8; 32], [u8; 32]) {
-    let mut t0 = hmac(key, &[input]);
-    let t1 = hmac(&t0, &[&[0x01]]);
-    let t2 = hmac(&t0, &[&t1, &[0x02]]);
-    ct::wipe_array(&mut t0);
+    let (mut t1, mut t2) = ([0u8; 32], [0u8; 32]);
+    kdf_into::<InTree, 2>(key, input, [&mut t1, &mut t2]);
     (t1, t2)
 }
 
 /// `Kdf3(key, input)`: returns `(τ1, τ2, τ3)`.
 #[must_use]
 pub fn kdf3(key: &[u8; 32], input: &[u8]) -> ([u8; 32], [u8; 32], [u8; 32]) {
-    let mut t0 = hmac(key, &[input]);
-    let t1 = hmac(&t0, &[&[0x01]]);
-    let t2 = hmac(&t0, &[&t1, &[0x02]]);
-    let t3 = hmac(&t0, &[&t2, &[0x03]]);
-    ct::wipe_array(&mut t0);
+    let (mut t1, mut t2, mut t3) = ([0u8; 32], [0u8; 32], [0u8; 32]);
+    kdf_into::<InTree, 3>(key, input, [&mut t1, &mut t2, &mut t3]);
     (t1, t2, t3)
+}
+
+/// `Kdf_N(key, input)` with the HMAC taken from a [`CryptoProvider`]: the
+/// outputs `τ1 … τN` are written, in order, to `outputs` — each straight
+/// into the place it is used from, never through a returned value. `τ0`
+/// is wiped before returning.
+pub fn kdf_into<P: CryptoProvider, const N: usize>(
+    key: &[u8; 32],
+    input: &[u8],
+    outputs: [&mut [u8; 32]; N],
+) {
+    let mut t0 = [0u8; 32];
+    P::hmac(key, &[input], &mut t0);
+    // τi = Hmac(τ0, τ(i−1) ∥ i), with τ1 = Hmac(τ0, 0x1).
+    let mut previous: Option<&[u8; 32]> = None;
+    let mut index = 0u8;
+    for out in outputs {
+        index = index.wrapping_add(1);
+        match previous {
+            None => P::hmac(&t0, &[&[index]], out),
+            Some(prev) => P::hmac(&t0, &[prev, &[index]], out),
+        }
+        previous = Some(out);
+    }
+    ct::wipe_array(&mut t0);
+}
+
+/// `Kdf_{N+1}(chain, input)` for the Noise chaining key: `τ1` replaces
+/// `chain` in place, and `τ2 …` go to `outputs`. This is the shape every
+/// `(C, …) := Kdf(C, input)` step of the handshake has.
+pub fn kdf_chain<P: CryptoProvider, const N: usize>(
+    chain: &mut [u8; 32],
+    input: &[u8],
+    outputs: [&mut [u8; 32]; N],
+) {
+    let mut t0 = [0u8; 32];
+    P::hmac(chain, &[input], &mut t0);
+    P::hmac(&t0, &[&[1u8]], chain);
+    let mut previous: &[u8; 32] = chain;
+    let mut index = 1u8;
+    for out in outputs {
+        index = index.wrapping_add(1);
+        P::hmac(&t0, &[previous, &[index]], out);
+        previous = out;
+    }
+    ct::wipe_array(&mut t0);
 }
 
 #[cfg(test)]

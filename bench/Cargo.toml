@@ -6,8 +6,10 @@ publish = false
 description = "Comparative micro-benchmarks: wireguard-embed vs BoringTun (in-process), plus a UDP loopback harness usable against wireguard-go / kernel."
 
 # This crate is its own workspace root (excluded from the parent) because
-# it has a path dependency on a sibling `../../boringtun` checkout that
-# may not exist on CI. Run with `cargo bench` from this directory.
+# it has a path dependency on a BoringTun checkout next to this repository
+# (`../../boringtun` from here), which a plain checkout of this repository
+# does not come with; CI clones it for the one job that builds this crate.
+# Run with `cargo bench` from this directory.
 [workspace]
 members = ["."]
 
@@ -26,6 +28,21 @@ ring = "0.17"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
+
+# The release profile of the repository's workspace: this crate is a
+# workspace of its own, and would otherwise measure cargo's defaults (no
+# link-time optimisation, sixteen codegen units) — not the build the
+# other numbers in this repository come from.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Warnings are errors in this crate's own code. Said here and not with
+# RUSTFLAGS, which would apply to the BoringTun path dependency as well:
+# warnings about a path dependency are not capped as a registry crate's
+# are, and BoringTun's are BoringTun's.
+[lints.rust]
+warnings = "deny"
 
 [[bench]]
 name = "compare"

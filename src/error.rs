@@ -1,89 +1,47 @@
-//! Error types.
+//! Error and drop-reason types.
+//!
+//! The crate separates two things that are easy to conflate:
+//!
+//! * [`Error`] — a **local fault**: the caller's buffer, the caller's
+//!   entropy source, the caller's configuration, or a bug in this crate.
+//!   Nothing a remote party sends can produce one, so propagating it with
+//!   `?` out of a receive loop is safe.
+//! * [`DropReason`] — why an **inbound datagram was rejected**. Rejecting
+//!   datagrams is the expected steady state on the open internet, so it is
+//!   never an `Err`: it is reported inside the `Ok` value
+//!   ([`crate::Incoming::Dropped`], [`crate::Received::Dropped`]).
 
 use core::fmt;
 
-/// Every way an operation on a [`crate::Tunnel`] can fail.
+/// A local fault. Never caused by a remote party.
 ///
-/// Errors are split into two informal classes, documented per variant:
-///
-/// * **Attacker-triggerable** (`InvalidPacket`, `InvalidMac1`, `AuthFailure`,
-///   `Replay`, …): returned while processing an incoming datagram. The packet
-///   has been rejected and **no protocol state was modified and nothing must
-///   be sent in response** — WireGuard stays silent toward unauthenticated
-///   peers. ([`crate::Stats`] failure counters are still incremented; see
-///   that type's note on exposure.) Callers should drop the datagram.
-///
-///   Do **not** surface the specific attacker-triggerable variant to
-///   untrusted observers (logs, per-variant metrics): which variant fires
-///   is itself an oracle (e.g. `InvalidMac1` vs `AuthFailure` confirms
-///   knowledge of this endpoint's static public key). The "silent toward
-///   unauthenticated peers" guarantee covers what is *sent*, not the time
-///   taken — which inherently differs between variants — so timing-based
-///   identity probing is a known property of the protocol, not of this
-///   implementation.
-/// * **Caller errors** (`BufferTooSmall`, `NotEstablished`, …): local
-///   conditions the caller can act upon.
+/// An operation that returns `Err` has sent nothing and lost nothing, and
+/// may be repeated once the fault is fixed. With two exceptions, both
+/// harmless and documented on [`crate::Tunnel`] ("Errors and state"), it
+/// has also left the protocol state exactly as it was: a session index
+/// that was reserved is not used again, and [`crate::Tunnel::poll`] has
+/// dealt with the timers that were due before the step that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Error {
-    /// The provided output buffer is too small for the message that needs to
-    /// be written. Caller error; see [`crate::transport_datagram_len`].
+    /// The provided output buffer is too small for the message that needs
+    /// to be written. The required sizes are fixed and documented on each
+    /// method; see also [`crate::transport_datagram_len`].
     BufferTooSmall,
-    /// No established session exists, so the payload cannot be encrypted
-    /// yet. Caller error; a handshake may have been emitted in its place,
-    /// retry after the handshake completes.
-    NotEstablished,
-    /// The datagram is structurally not a WireGuard message (bad length,
-    /// unknown type, non-zero reserved bytes). Attacker-triggerable.
-    InvalidPacket,
-    /// The `mac1` field of a handshake message is wrong, meaning the sender
-    /// does not know our public key. Attacker-triggerable; must be dropped
-    /// silently per whitepaper §5.3.
-    InvalidMac1,
-    /// AEAD or handshake authentication failed. Attacker-triggerable. No
-    /// plaintext has been written to the output buffer.
-    AuthFailure,
-    /// A handshake initiation authenticated correctly but was created by a
-    /// static key other than the configured peer. Attacker-triggerable (by
-    /// other legitimate holders of our public key).
-    UnknownPeer,
-    /// A handshake initiation carried a TAI64N timestamp not greater than
-    /// one we already accepted: a replayed or reordered initiation.
-    /// Attacker-triggerable; whitepaper §5.1.
-    ReplayedTimestamp,
-    /// A transport or handshake message referenced a receiver index that
-    /// does not match any live session or in-flight handshake.
-    /// Attacker-triggerable.
-    UnknownReceiverIndex,
-    /// The transport counter was already received or is too old for the
-    /// replay window (whitepaper §5.4.6). Attacker-triggerable.
-    Replay,
-    /// The session hit `REJECT_AFTER_TIME` / `REJECT_AFTER_MESSAGES`
-    /// (whitepaper §6.2) and refuses further traffic until rekeyed.
-    Expired,
-    /// A handshake response or cookie reply arrived but no matching
-    /// handshake is in flight. Attacker-triggerable (e.g. replayed
-    /// response).
-    NoPendingHandshake,
-    /// A cookie reply failed to decrypt or did not match the `mac1` of the
-    /// last handshake message we sent. Attacker-triggerable.
-    InvalidCookie,
-    /// An explicit handshake was requested more often than once per
-    /// `REKEY_TIMEOUT` (whitepaper §6.1: "Under no circumstances will
-    /// WireGuard send an initiation message more than once every
-    /// Rekey-Timeout."). Caller error.
-    HandshakeRateLimited,
-    /// The configured [`crate::EntropySource`] reported failure. Caller
-    /// environment error; the operation was aborted, no message was
-    /// produced.
+    /// The configured [`crate::EntropySource`] reported failure. No message
+    /// was produced.
     EntropyFailure,
-    /// A Diffie-Hellman operation involved a low-order/invalid public key
-    /// (the shared secret would be all-zero). Attacker-triggerable on the
-    /// receive path; a configuration error on the send path.
+    /// A configured public key cannot work: the peer's key equals our own,
+    /// or it is a low-order point (the shared secret would be all-zero).
     InvalidPublicKey,
+    /// The payload is longer than one ChaCha20-Poly1305 message can be
+    /// ([`crate::crypto::aead::MAX_MESSAGE_LEN`], a little under 256 GiB).
+    /// Nothing was encrypted.
+    MessageTooLong,
     /// An internal invariant did not hold. This is a defensive replacement
     /// for `panic!`: it should never be observed, and observing it
-    /// indicates a bug in this crate. The tunnel remains in a safe state.
+    /// indicates a bug in this crate. The state machine remains in a safe
+    /// state.
     Internal,
 }
 
@@ -91,20 +49,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
             Self::BufferTooSmall => "output buffer too small",
-            Self::NotEstablished => "no established session yet",
-            Self::InvalidPacket => "not a structurally valid WireGuard message",
-            Self::InvalidMac1 => "handshake message has invalid mac1",
-            Self::AuthFailure => "authentication failed",
-            Self::UnknownPeer => "authenticated initiation from a different static key",
-            Self::ReplayedTimestamp => "handshake initiation timestamp not newer than last",
-            Self::UnknownReceiverIndex => "receiver index does not match any session",
-            Self::Replay => "transport counter outside replay window",
-            Self::Expired => "session exceeded reject-after limits",
-            Self::NoPendingHandshake => "no matching in-flight handshake",
-            Self::InvalidCookie => "cookie reply failed authentication",
-            Self::HandshakeRateLimited => "initiation rate limited to one per REKEY_TIMEOUT",
             Self::EntropyFailure => "entropy source failed",
-            Self::InvalidPublicKey => "Diffie-Hellman result was the all-zero point",
+            Self::InvalidPublicKey => "configured public key is unusable",
+            Self::MessageTooLong => "payload too long for one AEAD message",
             Self::Internal => "internal invariant violated (bug in wireguard-sans-io)",
         };
         f.write_str(msg)
@@ -113,33 +60,124 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
+/// Why an inbound datagram was dropped.
+///
+/// Every variant is reachable by a remote party. When a datagram is
+/// dropped **nothing is sent in response and no protocol state changes**
+/// (WireGuard stays silent toward unauthenticated senders); only the
+/// failure counters in [`crate::Stats`] / [`crate::DeviceStats`] move.
+///
+/// Do **not** surface the specific variant to untrusted observers (public
+/// logs, per-variant metrics): which variant fires is itself an oracle
+/// (for example `InvalidMac1` versus `AuthFailure` confirms knowledge of
+/// this endpoint's static public key). The "silent" guarantee covers what
+/// is *sent*, not the time taken — which inherently differs between
+/// variants — so timing-based probing is a property of the protocol, not
+/// of this implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DropReason {
+    /// Structurally not a WireGuard message: bad length, unknown type, or
+    /// non-zero reserved bytes.
+    Malformed,
+    /// The `mac1` of a handshake message is wrong: the sender does not know
+    /// our public key (whitepaper §5.3).
+    InvalidMac1,
+    /// AEAD or handshake authentication failed.
+    AuthFailure,
+    /// A handshake initiation names a static key other than the one
+    /// configured for the tunnel it was handed to. (Its sender knows our
+    /// public key and holds the ephemeral key it sent; that it holds the
+    /// static key it names has not been checked at this point — the
+    /// tunnel refuses before the step that would.)
+    UnknownPeer,
+    /// A handshake initiation carried a TAI64N timestamp not greater than
+    /// one already accepted from this peer: a replayed or reordered
+    /// initiation (whitepaper §5.1).
+    ReplayedTimestamp,
+    /// A valid, fresh handshake initiation arrived less than
+    /// 1/[`crate::consts::INITIATIONS_PER_SECOND`] s after the previous one
+    /// from the same peer.
+    InitiationFlood,
+    /// The receiver index does not belong to any live session or in-flight
+    /// handshake of the tunnel it was routed to.
+    UnknownIndex,
+    /// The transport counter was already received or is older than the
+    /// replay window (whitepaper §5.4.6).
+    Replay,
+    /// The session the datagram belongs to is past `REJECT_AFTER_TIME`, or
+    /// the counter is at or beyond `REJECT_AFTER_MESSAGES` (whitepaper
+    /// §6.2).
+    Expired,
+    /// A handshake response or cookie reply arrived but no matching
+    /// handshake is in flight (for example a replayed response).
+    NoPendingHandshake,
+    /// A cookie reply failed to decrypt against the `mac1` of the last
+    /// handshake message we sent.
+    InvalidCookie,
+    /// A received ephemeral public key is a low-order point (the shared
+    /// secret would be all-zero).
+    InvalidPublicKey,
+}
+
+impl fmt::Display for DropReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            Self::Malformed => "not a structurally valid WireGuard message",
+            Self::InvalidMac1 => "handshake message has invalid mac1",
+            Self::AuthFailure => "authentication failed",
+            Self::UnknownPeer => "handshake initiation names a different static key",
+            Self::ReplayedTimestamp => "handshake initiation timestamp not newer than last",
+            Self::InitiationFlood => "handshake initiations arriving too fast",
+            Self::UnknownIndex => "receiver index does not match any session",
+            Self::Replay => "transport counter outside replay window",
+            Self::Expired => "session exceeded reject-after limits",
+            Self::NoPendingHandshake => "no matching in-flight handshake",
+            Self::InvalidCookie => "cookie reply failed authentication",
+            Self::InvalidPublicKey => "ephemeral public key is a low-order point",
+        };
+        f.write_str(msg)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Error;
+    use super::{DropReason, Error};
 
     #[test]
     fn display_is_total_and_distinct() {
         use std::collections::HashSet;
         use std::string::ToString;
-        let all = [
+        let errors = [
             Error::BufferTooSmall,
-            Error::NotEstablished,
-            Error::InvalidPacket,
-            Error::InvalidMac1,
-            Error::AuthFailure,
-            Error::UnknownPeer,
-            Error::ReplayedTimestamp,
-            Error::UnknownReceiverIndex,
-            Error::Replay,
-            Error::Expired,
-            Error::NoPendingHandshake,
-            Error::InvalidCookie,
-            Error::HandshakeRateLimited,
             Error::EntropyFailure,
             Error::InvalidPublicKey,
+            Error::MessageTooLong,
             Error::Internal,
         ];
-        let rendered: HashSet<_> = all.iter().map(ToString::to_string).collect();
-        assert_eq!(rendered.len(), all.len(), "error messages must be unique");
+        let drops = [
+            DropReason::Malformed,
+            DropReason::InvalidMac1,
+            DropReason::AuthFailure,
+            DropReason::UnknownPeer,
+            DropReason::ReplayedTimestamp,
+            DropReason::InitiationFlood,
+            DropReason::UnknownIndex,
+            DropReason::Replay,
+            DropReason::Expired,
+            DropReason::NoPendingHandshake,
+            DropReason::InvalidCookie,
+            DropReason::InvalidPublicKey,
+        ];
+        let rendered: HashSet<_> = errors
+            .iter()
+            .map(ToString::to_string)
+            .chain(drops.iter().map(ToString::to_string))
+            .collect();
+        assert_eq!(
+            rendered.len(),
+            errors.len() + drops.len(),
+            "messages must be unique"
+        );
     }
 }
