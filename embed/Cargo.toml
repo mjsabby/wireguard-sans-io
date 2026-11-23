@@ -16,22 +16,44 @@ default = []
 # buffers don't need kernel registration — but SlabPool gives them
 # stable Box-backed addresses anyway, which is what tokio-uring /
 # Windows RIO would need when you want true zero-copy later.
-async = ["dep:tokio"]
+#
+# (`rustix/net`, `rustix/std`: on Linux the loop has to read the socket's
+# error queue — see `embed/src/tokio.rs`. The dependency exists on Linux
+# and Android only; elsewhere this part of the feature enables nothing.)
+async = ["dep:tokio", "rustix/net", "rustix/std"]
 
 [dependencies]
 wireguard-sans-io = { path = "..", version = "1.0.0" }
-# SIMD ChaCha20 backends (the workspace's only `unsafe`). `Best` falls
-# back to scalar at runtime, so this never narrows portability.
+# SIMD ChaCha20 backends (the workspace's only `unsafe`). `Best` is the
+# AVX2 keystream outright in a build that enables AVX2, and otherwise
+# asks the CPU at run time and falls back to the scalar keystream — so a
+# dependent builds without special flags and runs on any x86_64.
 wireguard-chacha-simd = { path = "../simd", version = "1.0.0" }
 # OS entropy. Tiny, no transitive deps beyond cfg-if.
 getrandom = "0.2"
 # Async driver (feature-gated). `net` for UdpSocket, `time` for
 # sleep_until(next_wake), `sync` for the TUN-side mpsc channels,
 # `macros` for select!, `rt` so the doctest/example can spawn.
-tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "sync", "macros", "rt"] }
+# (1.32: the first release in which a task can wait for a socket to
+# signal an error, which is how the loop learns of ICMP errors.)
+tokio = { version = "1.32", optional = true, default-features = false, features = ["net", "time", "sync", "macros", "rt"] }
+
+# The two things the driver needs from Linux that the standard library
+# does not offer, through safe wrappers (this crate forbids `unsafe`):
+#
+# * the clock that keeps counting while the machine is suspended
+#   (`CLOCK_BOOTTIME`). `std::time::Instant` stands still there, and a
+#   tunnel that believes its session is as young as before the lid was
+#   closed sends on keys the peer has long expired;
+# * with `async`: reading a UDP socket's error queue (`MSG_ERRQUEUE`),
+#   without which a socket that has `IP_RECVERR` set fills up with ICMP
+#   errors and stops receiving.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix = { version = "1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "time", "sync", "macros", "rt-multi-thread"] }
+# `test-util`: the tests that run the event loop on a paused clock.
+tokio = { version = "1.32", features = ["net", "time", "sync", "macros", "rt-multi-thread", "test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

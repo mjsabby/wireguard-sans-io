@@ -1,12 +1,37 @@
-# AVX2 is a hard requirement of `wireguard-chacha-simd` on x86_64
-# (enforced by `compile_error!`). Setting it here means plain
-# `cargo build`/`test`/`bench` Just Works without RUSTFLAGS, and the
-# `#[target_feature(enable = "avx2")]` kernels are inlinable into
-# their callers.
+# Builds of this workspace enable AVX2 for the whole program on x86_64.
+# `wireguard-chacha-simd` then has nothing to ask the CPU about AVX2 —
+# a build without this asks on every call (a crate that depends on it,
+# for instance: a dependency's config file is not read) — and asks only
+# whether there is AVX-512 to use instead. The price: these binaries do
+# not start on a CPU without AVX2.
 #
 # `x86-64-v3` = Haswell (2013) baseline: AVX2 + BMI1/2 + FMA + MOVBE.
-# Override with `RUSTFLAGS="-C target-cpu=native"` for the host's
-# full feature set.
+# `RUSTFLAGS="-C target-cpu=x86-64"` gives a binary that runs anywhere
+# (the keystream is then chosen at run time: AVX-512, AVX2 or scalar).
+#
+# Do not reach for `-C target-cpu=native` — or any target with AVX-512
+# (`x86-64-v4`, `znver4`/`znver5`, `icelake-server`, `sapphirerapids`) —
+# without `-C no-vectorize-slp` next to it. With AVX-512's vector rotate
+# available, LLVM's SLP vectoriser rewrites the *scalar* ChaCha20 block
+# and the BLAKE2s compression as single-block vector code, which is
+# slower than what it replaces: measured on a Zen 5, where it is worst
+# (cycles; x86-64-v3 / native / native with `-C no-vectorize-slp`):
+#
+#   scalar ChaCha20, 64 bytes               304 /   471 /  304
+#   BLAKE2s, 64 bytes                       381 /   655 /  374
+#   Tunnel::encapsulate, 64 bytes           753 / 1,218 /  741
+#   wireguard-embed encapsulate, 64 bytes   878 / 1,341 /  862
+#   a handshake message with a bad mac1     800 / 1,363 /  778
+#
+# Larger packets do not notice (their keystream is the SIMD kernel's
+# either way), and nothing here needs `native` to use AVX-512: the
+# keystream backend detects it at run time.
+#
+# What these flags are worth, for the record (same machine): against a
+# build with none — which is what a crate that depends on these crates
+# gets — packets are within 3 % either way, and a handshake is about 5 %
+# slower with them (1.34 M cycles for both sides with setup, against
+# 1.27 M).
 
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-cpu=x86-64-v3"]

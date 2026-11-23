@@ -1,24 +1,70 @@
 //! X25519 Diffie-Hellman (RFC 7748) — whitepaper `DH()`.
 //!
 //! Field arithmetic over GF(2^255 − 19) in radix 2^51: five `u64` limbs,
-//! products accumulated in `u128`. The Montgomery ladder runs a fixed 255
-//! iterations with arithmetic conditional swaps; there are no
-//! secret-dependent branches or memory indices anywhere.
+//! products accumulated in `u128`. Two ladders, each of a fixed number of
+//! steps with arithmetic conditional swaps: the Montgomery ladder of
+//! RFC 7748 for any point, and a fixed-base ladder for the base point —
+//! key generation — which reads a table of constants in the order of its
+//! loop counter (cargo feature `x25519-table`, on by default; without it
+//! the base point takes the first ladder). There are no secret-dependent
+//! branches or memory indices anywhere.
 //!
 //! # Limb bound discipline
 //!
 //! Every operation documents its input/output bounds; the invariants are:
 //!
-//! * `from_bytes`, `mul`, `square`, `mul_small` produce *weakly reduced*
-//!   elements: limbs `< 2^51 + 2^13`.
-//! * `add` and `sub` accept weakly reduced inputs and produce limbs
-//!   `< 2^53`, which `mul`/`square` accept (their `u128` accumulators take
-//!   inputs up to `2^54` without overflow).
-//! * `to_bytes` accepts weakly reduced elements and emits the unique
+//! * `mul`, `square` and `mul_small` accept limbs `< 2^54` and produce
+//!   *weakly reduced* elements: limbs `< 2^51 + 2^18`. (`from_bytes` and
+//!   the table's constants are fully reduced: limbs `< 2^51`.)
+//! * `add` and `sub` do not reduce. Of weakly reduced inputs they give
+//!   limbs `< 2^52.6`; the fixed-base ladder applies them once more to
+//!   such a value and a weakly reduced one, for limbs `< 2^53.1`. That is
+//!   the most a multiplication is ever given.
+//! * `sub` needs a weakly reduced right-hand side (limbs `<= 2^52 − 38`).
+//! * `encode` accepts weakly reduced elements and emits the unique
 //!   canonical encoding, in constant time.
+//!
+//! # What is left behind
+//!
+//! The scalar's working copy and the ladder's state are wiped where they
+//! are declared. That does not reach the temporaries of the arithmetic —
+//! the sums and products of a ladder step are as good as its state — which
+//! the compiler keeps wherever it sees fit in the ladder's frame. So each
+//! ladder runs in a function of its own, notes how far down the stack it
+//! and what it calls reached ([`ct::stack_mark`]), and that much stack is
+//! overwritten once it has returned ([`ct::scrub_stack_to`]).
+//!
+//! # Inlining, speed and stack
+//!
+//! On a 64-bit target, in a build without debug assertions, the field
+//! operations are forced into the ladders (`inline(always)`). That is
+//! worth a tenth to a fifth of the time of a scalar multiplication there
+//! (measured on x86-64: the compiler's own choice leaves the
+//! multiplication a call), costs half a kilobyte of stack, and makes the
+//! marks above exact, since nothing is left beneath the functions that
+//! take them.
+//!
+//! Everywhere else it is left to the compiler:
+//!
+//! * on 32-bit targets, where the same inlining was measured to take two
+//!   kilobytes more stack (Cortex-M4, RV32) for a gain nobody has
+//!   measured — a limb multiplication there is a hundred instructions,
+//!   and a call is not what it waits for;
+//! * in builds with debug assertions, which is how this module tells an
+//!   unoptimised build from an optimised one: forced inlining at
+//!   `opt-level = 0` gives the ladder a frame of 75 KiB.
+//!
+//! There the field operations may be calls, with frames of their own
+//! beneath the marks, and a fixed allowance is made for them
+//! (`BELOW_MARK`): enough in an optimised build, not claimed to be
+//! enough at `opt-level = 0`.
 
 use crate::Error;
+use crate::crypto::bytes;
 use crate::crypto::ct;
+
+#[cfg(feature = "x25519-table")]
+mod base_table;
 
 /// 51-bit limb mask.
 const MASK: u64 = (1 << 51) - 1;
@@ -28,6 +74,23 @@ const MASK: u64 = (1 << 51) - 1;
 /// limb positive for any weakly reduced operand.
 const TWO_P0: u64 = 0x000f_ffff_ffff_ffda;
 const TWO_P1234: u64 = 0x000f_ffff_ffff_fffe;
+
+/// How far below the deepest [`ct::stack_mark`] of a ladder the stack is
+/// overwritten afterwards: room for what lies beneath the functions that
+/// take the marks.
+///
+/// Where the field operations are forced into those functions (see the
+/// module documentation) that is next to nothing: the few bytes of a
+/// mark's own frame and of a byte-copying helper. Elsewhere the field
+/// operations may be calls: a multiplication and the carry it ends with,
+/// which in an optimised build take under 200 bytes between them on the
+/// targets measured (x86-64, aarch64, 32-bit x86 and ARM). At
+/// `opt-level = 0` they take a few kilobytes, and this does not cover
+/// them. (`probes/` looks for what is left.)
+#[cfg(all(not(debug_assertions), target_pointer_width = "64"))]
+const BELOW_MARK: usize = 256;
+#[cfg(not(all(not(debug_assertions), target_pointer_width = "64")))]
+const BELOW_MARK: usize = 512;
 
 /// Widening u64 multiply. u64×u64 cannot overflow u128, so this is total.
 #[inline(always)]
@@ -52,11 +115,13 @@ impl Fe {
 
     /// Decode 32 little-endian bytes, masking bit 255 (RFC 7748 §5).
     /// Output limbs `<= MASK`.
+    #[cfg_attr(
+        all(not(debug_assertions), target_pointer_width = "64"),
+        inline(always)
+    )]
     fn from_bytes(bytes: &[u8; 32]) -> Self {
         let mut q = [0u64; 4];
-        for (qi, chunk) in q.iter_mut().zip(bytes.chunks_exact(8)) {
-            *qi = u64::from_le_bytes(<[u8; 8]>::try_from(chunk).unwrap_or([0; 8]));
-        }
+        bytes::load_le64(q.iter_mut(), bytes);
         let [t0, t1, t2, t3] = q;
         Self([
             t0 & MASK,
@@ -67,9 +132,13 @@ impl Fe {
         ])
     }
 
-    /// Canonical constant-time encoding. Accepts weakly reduced input
-    /// (limbs `< 2^52`).
-    fn to_bytes(self) -> [u8; 32] {
+    /// Canonical constant-time encoding, written to `out`. Accepts weakly
+    /// reduced input (limbs `< 2^52`).
+    #[cfg_attr(
+        all(not(debug_assertions), target_pointer_width = "64"),
+        inline(always)
+    )]
+    fn encode(&self, out: &mut [u8; 32]) {
         let [mut l0, mut l1, mut l2, mut l3, mut l4] = self.0;
 
         // One carry pass (with the 19-fold) to tighten limbs below
@@ -118,19 +187,34 @@ impl Fe {
         l4 = l4.wrapping_add(c);
         l4 &= MASK;
 
-        let o0 = l0 | (l1 << 51);
-        let o1 = (l1 >> 13) | (l2 << 38);
-        let o2 = (l2 >> 26) | (l3 << 25);
-        let o3 = (l3 >> 39) | (l4 << 12);
+        let mut words = [
+            l0 | (l1 << 51),
+            (l1 >> 13) | (l2 << 38),
+            (l2 >> 26) | (l3 << 25),
+            (l3 >> 39) | (l4 << 12),
+        ];
+        bytes::store_le64(out, words);
+        // The four words are the encoding itself.
+        ct::wipe_words(&mut words);
+    }
+
+    /// Zero the limbs where they lie.
+    fn wipe(&mut self) {
+        ct::wipe_words(&mut self.0);
+    }
+
+    #[cfg(test)]
+    fn to_bytes(self) -> [u8; 32] {
         let mut out = [0u8; 32];
-        for (chunk, word) in out.chunks_exact_mut(8).zip([o0, o1, o2, o3].iter()) {
-            chunk.copy_from_slice(&word.to_le_bytes());
-        }
+        self.encode(&mut out);
         out
     }
 
-    /// Limbwise sum; no reduction (outputs `< 2^53` for weakly reduced
-    /// inputs, fine as `mul`/`square` input).
+    /// Limbwise sum; no reduction.
+    #[cfg_attr(
+        all(not(debug_assertions), target_pointer_width = "64"),
+        inline(always)
+    )]
     fn add(self, rhs: Self) -> Self {
         let [a0, a1, a2, a3, a4] = self.0;
         let [b0, b1, b2, b3, b4] = rhs.0;
@@ -144,7 +228,12 @@ impl Fe {
     }
 
     /// `self − rhs`, computed as `self + 2p − rhs` limbwise so nothing
-    /// underflows for weakly reduced `rhs` (limbs `< 2^52 − 38`).
+    /// underflows for weakly reduced `rhs` (limbs `<= 2^52 − 38`). No
+    /// reduction: the result's limbs are below `self`'s plus `2^52`.
+    #[cfg_attr(
+        all(not(debug_assertions), target_pointer_width = "64"),
+        inline(always)
+    )]
     fn sub(self, rhs: Self) -> Self {
         let [a0, a1, a2, a3, a4] = self.0;
         let [b0, b1, b2, b3, b4] = rhs.0;
@@ -158,12 +247,15 @@ impl Fe {
     }
 
     /// Schoolbook multiplication mod p with the 19-fold on high cross
-    /// terms. The ladder feeds limbs `< 2^52.6` (via `add`/`sub` of
-    /// weakly-reduced values), giving accumulators `< 2^109` and a final
-    /// `c4·19` fold `< 2^62` — well inside `u64`. (The function would
-    /// tolerate limbs up to `2^53` in the `u128` accumulators, but the
-    /// `u64` `c4·19` fold in [`Self::carry`] requires the tighter ladder
-    /// bound; do not call with larger limbs.) Output is weakly reduced.
+    /// terms. Limbs `< 2^54` on both sides: the 19-fold limbs stay below
+    /// `2^58.3`, the accumulators below `77·2^108 < 2^114.3` (one product
+    /// of two limbs and four of a limb with a 19-fold limb) and the last
+    /// one, which has no folded terms, below `5·2^108 < 2^110.4` — the
+    /// bounds [`Self::carry`] is written for. Output is weakly reduced.
+    #[cfg_attr(
+        all(not(debug_assertions), target_pointer_width = "64"),
+        inline(always)
+    )]
     fn mul(self, rhs: Self) -> Self {
         let [a0, a1, a2, a3, a4] = self.0;
         let [b0, b1, b2, b3, b4] = rhs.0;
@@ -172,9 +264,8 @@ impl Fe {
         let b3_19 = b3.wrapping_mul(19);
         let b4_19 = b4.wrapping_mul(19);
 
-        // u64×u64 in u128 can never overflow; the 5-term sums stay below
-        // 2^115 (see the bound discipline note), so the wrapping ops never
-        // actually wrap.
+        // u64×u64 in u128 can never overflow, and the five-term sums stay
+        // below 2^114.3 (above), so the wrapping operations never wrap.
         let t0 = m(a0, b0)
             .wrapping_add(m(a1, b4_19))
             .wrapping_add(m(a2, b3_19))
@@ -216,6 +307,10 @@ impl Fe {
     /// t3 = 2·a0·a3 + 2·a1·a2 + 19·a4²
     /// t4 = 2·a0·a4 + 2·a1·a3 + a2²
     /// ```
+    #[cfg_attr(
+        all(not(debug_assertions), target_pointer_width = "64"),
+        inline(always)
+    )]
     fn square(self) -> Self {
         let [a0, a1, a2, a3, a4] = self.0;
         let d0 = a0.wrapping_mul(2);
@@ -238,29 +333,66 @@ impl Fe {
         Self::carry(t0, t1, t2, t3, t4)
     }
 
-    /// Shared carry chain from `u128` accumulators back to weakly reduced
-    /// limbs.
+    /// From five `u128` accumulators back to weakly reduced limbs, in two
+    /// rounds of carries that do not wait for each other.
+    ///
+    /// Round 1 splits every accumulator at bit 51 and adds each high part
+    /// to the limb above (the top one, times 19, to limb 0). Round 2 does
+    /// the same once more with what are by then small carries. A single
+    /// chain through all five accumulators and around again gives tighter
+    /// limbs, but every step of it waits for the one before.
+    ///
+    /// The high part `t >> 51` is `(lo >> 51) + (hi << 13)`, the two terms
+    /// having no bit in common; they are added to the limb above one after
+    /// the other. (Written as the one 128-bit shift it becomes a
+    /// double-precision shift instruction, which on current AMD cores is
+    /// microcoded and limited to one a cycle — a tenth of the micro-ops of
+    /// a scalar multiplication. Three plain instructions are the same or
+    /// better everywhere.)
+    ///
+    /// Bounds: accumulators `< 2^114.3`, the last one `< 2^110.4` (see
+    /// [`Self::mul`]). So `hi < 2^50.3`, which the shift by 13 does not
+    /// push out of the word; a round-1 sum is below
+    /// `2^51 + 2^13 + 2^63.3 < 2^64`, and that of limb 0 below
+    /// `2^51 + 19·(2^13 + 2^59.4) < 2^63.7`. Their high parts are `< 2^13`:
+    /// the result has limbs `< 2^51 + 2^13`, limb 0 `< 2^51 + 19·2^13`.
+    #[cfg_attr(
+        all(not(debug_assertions), target_pointer_width = "64"),
+        inline(always)
+    )]
     fn carry(t0: u128, t1: u128, t2: u128, t3: u128, t4: u128) -> Self {
-        // Accumulators are < 2^115, so adding a < 2^64 carry never wraps.
-        let t1 = t1.wrapping_add(t0 >> 51);
-        let r0 = (t0 as u64) & MASK;
-        let t2 = t2.wrapping_add(t1 >> 51);
-        let r1 = (t1 as u64) & MASK;
-        let t3 = t3.wrapping_add(t2 >> 51);
-        let r2 = (t2 as u64) & MASK;
-        let t4 = t4.wrapping_add(t3 >> 51);
-        let r3 = (t3 as u64) & MASK;
-        let c4 = (t4 >> 51) as u64;
-        let r4 = (t4 as u64) & MASK;
-        let r0 = r0.wrapping_add(c4.wrapping_mul(19));
-        let c = r0 >> 51;
-        let r0 = r0 & MASK;
-        let r1 = r1.wrapping_add(c);
-        Self([r0, r1, r2, r3, r4])
+        /// `(lo >> 51, hi << 13)`: the two terms of `t >> 51`.
+        #[inline(always)]
+        fn high(t: u128) -> (u64, u64) {
+            ((t as u64) >> 51, ((t >> 64) as u64) << 13)
+        }
+        let (a0, b0) = high(t0);
+        let (a1, b1) = high(t1);
+        let (a2, b2) = high(t2);
+        let (a3, b3) = high(t3);
+        let (a4, b4) = high(t4);
+        let s0 = ((t0 as u64) & MASK)
+            .wrapping_add(a4.wrapping_mul(19))
+            .wrapping_add(b4.wrapping_mul(19));
+        let s1 = ((t1 as u64) & MASK).wrapping_add(a0).wrapping_add(b0);
+        let s2 = ((t2 as u64) & MASK).wrapping_add(a1).wrapping_add(b1);
+        let s3 = ((t3 as u64) & MASK).wrapping_add(a2).wrapping_add(b2);
+        let s4 = ((t4 as u64) & MASK).wrapping_add(a3).wrapping_add(b3);
+        Self([
+            (s0 & MASK).wrapping_add((s4 >> 51).wrapping_mul(19)),
+            (s1 & MASK).wrapping_add(s0 >> 51),
+            (s2 & MASK).wrapping_add(s1 >> 51),
+            (s3 & MASK).wrapping_add(s2 >> 51),
+            (s4 & MASK).wrapping_add(s3 >> 51),
+        ])
     }
 
-    /// Multiply by a small constant (121665 = (A−2)/4). Output weakly
-    /// reduced.
+    /// Multiply by a small constant (121665 = (A−2)/4). Limbs `< 2^54`;
+    /// output weakly reduced.
+    #[cfg_attr(
+        all(not(debug_assertions), target_pointer_width = "64"),
+        inline(always)
+    )]
     fn mul_small(self, k: u32) -> Self {
         let [a0, a1, a2, a3, a4] = self.0;
         let k = u64::from(k);
@@ -268,43 +400,97 @@ impl Fe {
     }
 
     /// `self^(p−2) = self^−1` (and `0 ↦ 0`), classic addition chain.
-    fn invert(self) -> Self {
-        fn nsquare(mut x: Fe, n: u32) -> Fe {
+    ///
+    /// `low` is lowered to the deepest [`ct::stack_mark`] taken here and
+    /// in the squaring loops (see the module documentation). Neither is
+    /// ever inlined, so that where those marks are taken does not depend
+    /// on what a compiler decides to inline: this function's frame lies
+    /// beneath the ladder's, a squaring loop's beneath this one's.
+    #[inline(never)]
+    fn invert(self, low: &mut usize) -> Self {
+        #[inline(never)]
+        fn nsquare(mut x: Fe, n: u32, low: &mut usize) -> Fe {
+            *low = (*low).min(ct::stack_mark());
             for _ in 0..n {
                 x = x.square();
             }
             x
         }
+        *low = (*low).min(ct::stack_mark());
         let z = self;
         let z2 = z.square(); // 2
-        let z9 = nsquare(z2, 2).mul(z); // 9
+        let z9 = nsquare(z2, 2, low).mul(z); // 9
         let z11 = z9.mul(z2); // 11
         let z_5_0 = z11.square().mul(z9); // 31 = 2^5 − 1
-        let z_10_0 = nsquare(z_5_0, 5).mul(z_5_0); // 2^10 − 1
-        let z_20_0 = nsquare(z_10_0, 10).mul(z_10_0); // 2^20 − 1
-        let z_40_0 = nsquare(z_20_0, 20).mul(z_20_0); // 2^40 − 1
-        let z_50_0 = nsquare(z_40_0, 10).mul(z_10_0); // 2^50 − 1
-        let z_100_0 = nsquare(z_50_0, 50).mul(z_50_0); // 2^100 − 1
-        let z_200_0 = nsquare(z_100_0, 100).mul(z_100_0); // 2^200 − 1
-        let z_250_0 = nsquare(z_200_0, 50).mul(z_50_0); // 2^250 − 1
-        nsquare(z_250_0, 5).mul(z11) // 2^255 − 21
+        let z_10_0 = nsquare(z_5_0, 5, low).mul(z_5_0); // 2^10 − 1
+        let z_20_0 = nsquare(z_10_0, 10, low).mul(z_10_0); // 2^20 − 1
+        let z_40_0 = nsquare(z_20_0, 20, low).mul(z_20_0); // 2^40 − 1
+        let z_50_0 = nsquare(z_40_0, 10, low).mul(z_10_0); // 2^50 − 1
+        let z_100_0 = nsquare(z_50_0, 50, low).mul(z_50_0); // 2^100 − 1
+        let z_200_0 = nsquare(z_100_0, 100, low).mul(z_100_0); // 2^200 − 1
+        let z_250_0 = nsquare(z_200_0, 50, low).mul(z_50_0); // 2^250 − 1
+        nsquare(z_250_0, 5, low).mul(z11) // 2^255 − 21
     }
 
-    /// Constant-time conditional swap: exchanges `a` and `b` iff
-    /// `swap == 1`. `swap` must be 0 or 1.
-    fn cswap(swap: u64, a: &mut Self, b: &mut Self) {
+    /// Constant-time conditional swap of two pairs: exchanges `a` with
+    /// `b` and `c` with `d` iff `swap == 1`. `swap` must be 0 or 1.
+    ///
+    /// Both swaps of a ladder step are behind one optimisation barrier.
+    /// The barrier keeps the compiler from learning that the mask is one
+    /// of two values and branching on it; it is also a point at which
+    /// everything whose address is taken anywhere — the ladder's state
+    /// is, by the wipe at the end — has to be in memory, so each one is a
+    /// round trip of that state through the stack.
+    #[cfg_attr(
+        all(not(debug_assertions), target_pointer_width = "64"),
+        inline(always)
+    )]
+    fn cswap2(swap: u64, a: &mut Self, b: &mut Self, c: &mut Self, d: &mut Self) {
         let mask = 0u64.wrapping_sub(core::hint::black_box(swap));
         for (x, y) in a.0.iter_mut().zip(b.0.iter_mut()) {
             let t = mask & (*x ^ *y);
             *x ^= t;
             *y ^= t;
         }
+        for (x, y) in c.0.iter_mut().zip(d.0.iter_mut()) {
+            let t = mask & (*x ^ *y);
+            *x ^= t;
+            *y ^= t;
+        }
     }
+
+    /// One doubling in the ladder's coordinates: `(x : z) := 2·(x : z)`.
+    #[cfg(any(test, feature = "x25519-table"))]
+    #[cfg_attr(
+        all(not(debug_assertions), target_pointer_width = "64"),
+        inline(always)
+    )]
+    fn double(x: &mut Self, z: &mut Self) {
+        let aa = x.add(*z).square();
+        let bb = x.sub(*z).square();
+        let e = aa.sub(bb);
+        *x = aa.mul(bb);
+        *z = e.mul(aa.add(e.mul_small(121_665)));
+    }
+}
+
+/// Bit `t` of a scalar, as 0 or 1.
+#[inline(always)]
+fn scalar_bit(k: &[u8; 32], t: usize) -> u64 {
+    let byte = k.get(t >> 3).copied().unwrap_or(0);
+    u64::from((byte >> (t & 7)) & 1)
 }
 
 /// RFC 7748 §5 scalar clamping.
 #[must_use]
 pub fn clamp_scalar(mut scalar: [u8; 32]) -> [u8; 32] {
+    clamp_in_place(&mut scalar);
+    scalar
+}
+
+/// RFC 7748 §5 scalar clamping, in place: the form for a scalar that is a
+/// secret, of which [`clamp_scalar`] would make a second copy.
+pub fn clamp_in_place(scalar: &mut [u8; 32]) {
     if let Some(first) = scalar.first_mut() {
         *first &= 248;
     }
@@ -312,14 +498,48 @@ pub fn clamp_scalar(mut scalar: [u8; 32]) -> [u8; 32] {
         *last &= 127;
         *last |= 64;
     }
-    scalar
 }
 
 /// The X25519 function: scalar multiplication on the Montgomery curve.
 /// `scalar` is clamped internally; bit 255 of `u` is ignored (RFC 7748).
+///
+/// The result comes back by value: into a place of the caller's, and
+/// nowhere else — the frame it is computed in is overwritten afterwards
+/// ([`ct::ScrubOnDrop`]). What becomes of the caller's copy is the
+/// caller's business; [`x25519_into`] writes it where it is to stay.
 #[must_use]
 pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> [u8; 32] {
-    let k = clamp_scalar(*scalar);
+    let mut scrub = ct::ScrubOnDrop::new();
+    x25519_by_value(scalar, u, scrub.low())
+}
+
+/// [`x25519`]'s work, in a frame of its own; `low` says where it ends.
+#[inline(never)]
+fn x25519_by_value(scalar: &[u8; 32], u: &[u8; 32], low: &mut usize) -> [u8; 32] {
+    *low = ct::stack_mark();
+    let mut out = [0u8; 32];
+    x25519_into(scalar, u, &mut out);
+    out
+}
+
+/// As [`x25519`], writing the result to `out`. This is the form to use
+/// when the result is a secret: nothing is returned by value, and the
+/// clamped scalar and everything the ladder worked with are wiped before
+/// returning.
+pub fn x25519_into(scalar: &[u8; 32], u: &[u8; 32], out: &mut [u8; 32]) {
+    let low = ladder(scalar, u, out);
+    ct::scrub_stack_to(low.saturating_sub(BELOW_MARK));
+}
+
+/// The Montgomery ladder of RFC 7748 §5. Not inlined: its frame, and what
+/// lies beneath it, is what [`x25519_into`] overwrites afterwards. Returns
+/// how far down that goes.
+#[inline(never)]
+fn ladder(scalar: &[u8; 32], u: &[u8; 32], out: &mut [u8; 32]) -> usize {
+    let mut low = ct::stack_mark();
+    let mut k = [0u8; 32];
+    ct::copy_secret(&mut k, scalar);
+    clamp_in_place(&mut k);
     let x1 = Fe::from_bytes(u);
     let mut x2 = Fe::ONE;
     let mut z2 = Fe::ZERO;
@@ -330,11 +550,9 @@ pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> [u8; 32] {
     let mut t = 255usize;
     while t > 0 {
         t = t.wrapping_sub(1);
-        let byte = k.get(t >> 3).copied().unwrap_or(0);
-        let bit = u64::from((byte >> (t & 7)) & 1);
+        let bit = scalar_bit(&k, t);
         swap ^= bit;
-        Fe::cswap(swap, &mut x2, &mut x3);
-        Fe::cswap(swap, &mut z2, &mut z3);
+        Fe::cswap2(swap, &mut x2, &mut x3, &mut z2, &mut z3);
         swap = bit;
 
         // RFC 7748 §5 ladder step.
@@ -352,12 +570,18 @@ pub fn x25519(scalar: &[u8; 32], u: &[u8; 32]) -> [u8; 32] {
         x2 = aa.mul(bb);
         z2 = e.mul(aa.add(e.mul_small(121_665)));
     }
-    Fe::cswap(swap, &mut x2, &mut x3);
-    Fe::cswap(swap, &mut z2, &mut z3);
+    Fe::cswap2(swap, &mut x2, &mut x3, &mut z2, &mut z3);
 
     // z2 == 0 (low-order input) inverts to 0 and yields an all-zero
     // output, which `shared_secret` rejects.
-    x2.mul(z2.invert()).to_bytes()
+    let mut affine = x2.mul(z2.invert(&mut low));
+    affine.encode(out);
+
+    ct::wipe_array(&mut k);
+    for fe in [&mut affine, &mut x2, &mut z2, &mut x3, &mut z3] {
+        fe.wipe();
+    }
+    low
 }
 
 /// The X25519 base point (u = 9).
@@ -365,10 +589,101 @@ pub const BASEPOINT: [u8; 32] = [
     9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
-/// Derive the public key for a private key.
+/// Derive the public key for a private key: `x25519(scalar, BASEPOINT)`.
+///
+/// With the cargo feature `x25519-table` (on by default) this is a ladder
+/// made for the base point: constant time like the other, a little over
+/// half its cost, and 10 KiB of constants. Without the feature it is the
+/// other ladder.
 #[must_use]
 pub fn x25519_base(scalar: &[u8; 32]) -> [u8; 32] {
-    x25519(scalar, &BASEPOINT)
+    let mut out = [0u8; 32];
+    #[cfg(feature = "x25519-table")]
+    {
+        let low = base_ladder(scalar, &mut out);
+        ct::scrub_stack_to(low.saturating_sub(BELOW_MARK));
+    }
+    #[cfg(not(feature = "x25519-table"))]
+    x25519_into(scalar, &BASEPOINT, &mut out);
+    out
+}
+
+/// The fixed-base ladder of Oliveira, López, Hışıl, Faz-Hernández and
+/// Rodríguez-Henríquez ("How to (pre-)compute a ladder", SAC 2017).
+///
+/// A clamped scalar is a multiple of 8; let `k' = k/8`, `G` the base
+/// point and `S` a point of order 4 (`x = 1`). The loop keeps
+///
+/// ```text
+/// R1 = (k' mod 2^m)·G + S        R2 = R1 − 2^m·G
+/// ```
+///
+/// Step `m` is one differential addition with `2^m·G`. For a 1 bit it is
+/// `R1 := R1 + 2^m·G`, whose difference is `R2`; for a 0 bit
+/// `R2 := R2 − 2^m·G`, whose difference is `R1`. Either way the pair's
+/// difference is `2^(m+1)·G` afterwards. The point `2^m·G` enters only
+/// through `μ_m = (x + 1)/(x − 1)` of its x-coordinate, which is the
+/// table: with `(X : Z)` the point to update and `(X' : Z')` the other,
+///
+/// ```text
+/// X := Z'·((X + Z) + μ_m·(X − Z))²        Z := X'·((X + Z) − μ_m·(X − Z))²
+/// ```
+///
+/// which is the ordinary differential addition with both coordinates
+/// divided by `(x − 1)²`: three multiplications and two squarings a bit,
+/// against five, four and a small one. Three doublings at the end give
+/// `8·(k'·G + S) = k·G`.
+///
+/// `S` is what makes this sound. A differential addition fails only when
+/// the difference is the point at infinity or the point of order 2. Every
+/// point above is `j·G + S` for some `j`; `j·G` has odd order or is the
+/// identity, so the sum has order divisible by 4 and is neither. For the
+/// same reason no `Z` here is ever zero, and `x(2^m·G)` is never 1.
+///
+/// Constant time for the same reasons as [`ladder`]: the table is read in
+/// the order of the loop counter, never at a secret index; the scalar's
+/// bits steer the same arithmetic conditional swaps.
+#[cfg(feature = "x25519-table")]
+#[inline(never)]
+fn base_ladder(scalar: &[u8; 32], out: &mut [u8; 32]) -> usize {
+    let mut low = ct::stack_mark();
+    let mut k = [0u8; 32];
+    ct::copy_secret(&mut k, scalar);
+    clamp_in_place(&mut k);
+    // (u1 : z1) is the point to update, (u2 : z2) the other: R1 and R2 to
+    // begin with.
+    let mut u1 = Fe::ONE;
+    let mut z1 = Fe::ONE;
+    let mut u2 = Fe(base_table::S_MINUS_G);
+    let mut z2 = Fe::ONE;
+    // Whether R1 is in the first place. A step needs it there for a 1 bit
+    // and R2 for a 0 bit, so it swaps when its bit differs from this.
+    let mut r1_first = 1u64;
+    // Scalar bit `m + 3` goes with entry `m`.
+    for (mu, t) in base_table::MU.iter().zip(3usize..) {
+        let bit = scalar_bit(&k, t);
+        Fe::cswap2(r1_first ^ bit, &mut u1, &mut u2, &mut z1, &mut z2);
+        r1_first = bit;
+
+        let b = u1.sub(z1);
+        let a = u1.add(z1);
+        let c = Fe(*mu).mul(b);
+        u1 = z2.mul(a.add(c).square());
+        z1 = u2.mul(a.sub(c).square());
+    }
+    // Bit 254 of a clamped scalar is set, so the last step left R1 in the
+    // first place: (u1 : z1) is k'·G + S. Times 8:
+    for _ in 0..3 {
+        Fe::double(&mut u1, &mut z1);
+    }
+    let mut affine = u1.mul(z1.invert(&mut low));
+    affine.encode(out);
+
+    ct::wipe_array(&mut k);
+    for fe in [&mut affine, &mut u1, &mut z1, &mut u2, &mut z2] {
+        fe.wipe();
+    }
+    low
 }
 
 /// Diffie-Hellman with mandatory contributory-behaviour check: an all-zero
@@ -378,12 +693,37 @@ pub fn x25519_base(scalar: &[u8; 32]) -> [u8; 32] {
 /// # Errors
 /// [`Error::InvalidPublicKey`] if the shared secret is all-zero.
 pub fn shared_secret(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32], Error> {
-    let mut out = x25519(private, peer_public);
-    if ct::ct_is_zero(&out) {
-        ct::wipe_array(&mut out);
-        return Err(Error::InvalidPublicKey);
+    // By value, as in `x25519`.
+    let mut scrub = ct::ScrubOnDrop::new();
+    shared_secret_by_value(private, peer_public, scrub.low())
+}
+
+/// [`shared_secret`]'s work, in a frame of its own; `low` says where it
+/// ends.
+#[inline(never)]
+fn shared_secret_by_value(
+    private: &[u8; 32],
+    peer_public: &[u8; 32],
+    low: &mut usize,
+) -> Result<[u8; 32], Error> {
+    *low = ct::stack_mark();
+    let mut out = [0u8; 32];
+    if shared_secret_into(private, peer_public, &mut out) {
+        Ok(out)
+    } else {
+        Err(Error::InvalidPublicKey)
     }
-    Ok(out)
+}
+
+/// As [`shared_secret`], writing the secret to `out` instead of returning
+/// it. Returns `false` — with `out` all-zero — when the shared secret is
+/// the all-zero value.
+#[must_use]
+pub fn shared_secret_into(private: &[u8; 32], peer_public: &[u8; 32], out: &mut [u8; 32]) -> bool {
+    x25519_into(private, peer_public, out);
+    // `out` is all-zero exactly when this is false, so there is nothing
+    // left to wipe in that case.
+    !ct::ct_is_zero(out)
 }
 
 #[cfg(test)]
@@ -499,7 +839,7 @@ mod tests {
             let z = Fe::from_bytes(&bytes);
             assert_eq!(z.square().to_bytes(), z.mul(z).to_bytes());
             // x · x^(p−2) ≡ 1 for x ≠ 0.
-            let inv = z.invert();
+            let inv = z.inverse();
             assert_eq!(z.mul(inv).to_bytes(), Fe::ONE.to_bytes());
         }
         // Sub/add/mul_small consistency: (a + b) − b ≡ a.
@@ -551,6 +891,244 @@ mod tests {
         }
         // A valid point is accepted.
         assert!(shared_secret(&priv_key, &BASEPOINT).is_ok());
+    }
+
+    impl Fe {
+        /// The inverse, for tests that have no use for the stack mark.
+        fn inverse(self) -> Fe {
+            let mut low = usize::MAX;
+            self.invert(&mut low)
+        }
+    }
+
+    /// The value of an element whatever its limbs look like: through the
+    /// canonical encoding and back.
+    fn canonical(x: Fe) -> Fe {
+        Fe::from_bytes(&x.to_bytes())
+    }
+
+    #[test]
+    fn multiplication_at_the_documented_limb_bounds() {
+        // `mul`, `square` and `mul_small` are documented for limbs below
+        // 2^54. Nothing may wrap there: the product of two such elements
+        // must be the product of their reduced forms. (`encode` is given
+        // more than it documents here; one carry pass is all it needs
+        // below 2^63.)
+        const TOP: u64 = (1 << 54) - 1;
+        let mut rng = Rng(0xb0bd);
+        let mut cases: Vec<Fe> = std::vec![
+            Fe([TOP; 5]),
+            Fe([TOP, 0, TOP, 0, TOP]),
+            Fe([0, TOP, 0, TOP, 0]),
+            Fe([MASK; 5]),
+            Fe([TOP, MASK, 1, 0, TOP]),
+        ];
+        for one in 0..5 {
+            let mut limbs = [0u64; 5];
+            limbs[one] = TOP;
+            cases.push(Fe(limbs));
+            let mut limbs = [TOP; 5];
+            limbs[one] = 0;
+            cases.push(Fe(limbs));
+        }
+        for _ in 0..48 {
+            let r = rng.next32();
+            let mut limbs = [0u64; 5];
+            for (limb, chunk) in limbs.iter_mut().zip(r.chunks(6)) {
+                let mut word = [0u8; 8];
+                word[..6].copy_from_slice(&chunk[..6]);
+                // The top six bits set: between 2^53.9 and 2^54.
+                *limb = (u64::from_le_bytes(word) & TOP) | (0x3f << 48);
+            }
+            cases.push(Fe(limbs));
+        }
+        for a in &cases {
+            let ca = canonical(*a);
+            assert_eq!(a.square().to_bytes(), ca.square().to_bytes());
+            assert_eq!(a.square().to_bytes(), ca.mul(ca).to_bytes());
+            assert_eq!(
+                a.mul_small(u32::MAX).to_bytes(),
+                ca.mul_small(u32::MAX).to_bytes()
+            );
+            assert_eq!(
+                a.mul_small(121_665).to_bytes(),
+                ca.mul_small(121_665).to_bytes()
+            );
+            for b in &cases {
+                let cb = canonical(*b);
+                assert_eq!(a.mul(*b).to_bytes(), ca.mul(cb).to_bytes());
+            }
+            // What comes out is weakly reduced, as documented.
+            for out in [a.square(), a.mul(*a), a.mul_small(u32::MAX)] {
+                assert!(out.0[0] < (1 << 51) + 19 * (1 << 13));
+                assert!(out.0[1..].iter().all(|l| *l < (1 << 51) + (1 << 13)));
+            }
+        }
+    }
+
+    #[test]
+    fn field_identities_on_random_elements() {
+        // Independent of how a product is carried: the ring laws.
+        let mut rng = Rng(0x1de4);
+        for _ in 0..200 {
+            let a = Fe::from_bytes(&rng.next32());
+            let b = Fe::from_bytes(&rng.next32());
+            let c = Fe::from_bytes(&rng.next32());
+            assert_eq!(a.mul(b).to_bytes(), b.mul(a).to_bytes());
+            assert_eq!(a.mul(b).mul(c).to_bytes(), a.mul(b.mul(c)).to_bytes());
+            assert_eq!(
+                a.mul(b.add(c)).to_bytes(),
+                a.mul(b).add(a.mul(c)).mul(Fe::ONE).to_bytes()
+            );
+            assert_eq!(
+                a.add(b).square().to_bytes(),
+                a.square()
+                    .add(b.square())
+                    .add(a.mul(b).mul_small(2))
+                    .mul(Fe::ONE)
+                    .to_bytes()
+            );
+            assert_eq!(a.sub(a).mul(Fe::ONE).to_bytes(), [0u8; 32]);
+        }
+        // Small numbers, by hand: 2^255 ≡ 19, so 2^128·2^127 = 19.
+        let mut two_128 = [0u8; 32];
+        two_128[16] = 1;
+        let mut two_127 = [0u8; 32];
+        two_127[15] = 0x80;
+        let mut nineteen = [0u8; 32];
+        nineteen[0] = 19;
+        assert_eq!(
+            Fe::from_bytes(&two_128)
+                .mul(Fe::from_bytes(&two_127))
+                .to_bytes(),
+            nineteen
+        );
+        // (p − 1)² = 1 and (p − 1)·2 = p − 2.
+        let pm1 = Fe::from_bytes(&arr(
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ));
+        assert_eq!(pm1.square().to_bytes(), Fe::ONE.to_bytes());
+        assert_eq!(
+            pm1.mul_small(2).to_bytes(),
+            arr("ebffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f")
+        );
+    }
+
+    #[test]
+    fn the_swap_exchanges_both_pairs_or_neither() {
+        let mut rng = Rng(0x5a9);
+        let fresh = |rng: &mut Rng| Fe::from_bytes(&rng.next32());
+        let (a, b, c, d) = (
+            fresh(&mut rng),
+            fresh(&mut rng),
+            fresh(&mut rng),
+            fresh(&mut rng),
+        );
+        let (mut w, mut x, mut y, mut z) = (a, b, c, d);
+        Fe::cswap2(0, &mut w, &mut x, &mut y, &mut z);
+        assert_eq!((w.0, x.0, y.0, z.0), (a.0, b.0, c.0, d.0));
+        Fe::cswap2(1, &mut w, &mut x, &mut y, &mut z);
+        assert_eq!((w.0, x.0, y.0, z.0), (b.0, a.0, d.0, c.0));
+    }
+
+    /// The fixed-base ladder is the ordinary one at the base point. (When
+    /// the table is not built in, this compares the ladder with itself.)
+    #[test]
+    fn base_point_multiplication_agrees_with_the_ladder() {
+        let mut rng = Rng(0xba5e);
+        for _ in 0..300 {
+            let s = rng.next32();
+            assert_eq!(x25519_base(&s), x25519(&s, &BASEPOINT));
+        }
+        // The extremes of a clamped scalar, and every bit by itself: a
+        // step that takes the other branch of its swap exactly once.
+        for s in [[0u8; 32], [0xffu8; 32], [1u8; 32], [0x80u8; 32]] {
+            assert_eq!(x25519_base(&s), x25519(&s, &BASEPOINT));
+        }
+        for t in 0..256 {
+            let mut one = [0u8; 32];
+            one[t >> 3] |= 1 << (t & 7);
+            assert_eq!(x25519_base(&one), x25519(&one, &BASEPOINT), "bit {t}");
+            let mut all_but = [0xffu8; 32];
+            all_but[t >> 3] &= !(1 << (t & 7));
+            assert_eq!(
+                x25519_base(&all_but),
+                x25519(&all_but, &BASEPOINT),
+                "all but bit {t}"
+            );
+        }
+    }
+
+    /// Every constant of the fixed-base ladder, from first principles.
+    #[cfg(feature = "x25519-table")]
+    #[test]
+    fn the_table_is_what_it_says() {
+        // One entry for every bit of a clamped scalar above its three
+        // zero bits and up to bit 254.
+        assert_eq!(base_table::MU.len(), 252);
+        // μ_m·(x − z) = x + z for (x : z) = 2^m·G, by repeated doubling
+        // from the base point.
+        let mut x = Fe::from_bytes(&BASEPOINT);
+        let mut z = Fe::ONE;
+        for (m, mu) in base_table::MU.iter().enumerate() {
+            assert!(mu.iter().all(|limb| *limb <= MASK), "entry {m}");
+            assert_eq!(canonical(Fe(*mu)).0, *mu, "entry {m} is not reduced");
+            assert_eq!(
+                Fe(*mu).mul(x.sub(z)).to_bytes(),
+                x.add(z).mul(Fe::ONE).to_bytes(),
+                "entry {m}"
+            );
+            Fe::double(&mut x, &mut z);
+        }
+
+        // x(S − G): a root of 64·(t² + 1) = 17520032·t, which is
+        // t + 1/t = x(S − G) + x(S + G) for x(S) = 1 and x(G) = 9 on
+        // y² = x³ + 486662·x² + x.
+        let t = Fe(base_table::S_MINUS_G);
+        assert!(base_table::S_MINUS_G.iter().all(|limb| *limb <= MASK));
+        assert_eq!(canonical(t).0, base_table::S_MINUS_G);
+        assert_eq!(
+            t.square().add(Fe::ONE).mul_small(64).to_bytes(),
+            t.mul_small(17_520_032).to_bytes()
+        );
+        // The sum of the two roots, from the curve equation: with
+        // f(x) = x³ + A·x² + x,
+        // x(P+Q) + x(P−Q) = 2·(f(x1) + f(x2))/(x1 − x2)² − 2·(A + x1 + x2).
+        let small = |n: u32| Fe::ONE.mul_small(n);
+        let f = |x: Fe| {
+            x.square()
+                .mul(x)
+                .add(x.square().mul_small(486_662))
+                .add(x)
+                .mul(Fe::ONE)
+        };
+        let (x1, x2) = (small(1), small(9));
+        let sum = f(x1)
+            .add(f(x2))
+            .mul_small(2)
+            .mul(x1.sub(x2).square().inverse())
+            .sub(small(2 * (486_662 + 1 + 9)));
+        // t² + 1 = sum·t
+        assert_eq!(
+            t.square().add(Fe::ONE).mul(Fe::ONE).to_bytes(),
+            sum.mul(t).to_bytes()
+        );
+    }
+
+    /// The doubling used at the end of the fixed-base ladder (and by the
+    /// table's test) against the ladder: 2^n·G for a clamped-looking n.
+    #[test]
+    fn doubling_agrees_with_the_ladder() {
+        let mut x = Fe::from_bytes(&BASEPOINT);
+        let mut z = Fe::ONE;
+        for _ in 0..254 {
+            Fe::double(&mut x, &mut z);
+        }
+        // The all-zero scalar clamps to 2^254.
+        assert_eq!(
+            x.mul(z.inverse()).to_bytes(),
+            x25519(&[0u8; 32], &BASEPOINT)
+        );
     }
 
     #[test]

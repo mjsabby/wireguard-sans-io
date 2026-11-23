@@ -8,34 +8,51 @@
 
 use crate::consts::REJECT_AFTER_MESSAGES;
 
-/// Window width in bits — the *effective* window, i.e. the number of
-/// counters behind `greatest` that are still accepted. 8128 matches the
-/// Linux kernel exactly (`COUNTER_WINDOW_SIZE = COUNTER_BITS_TOTAL −
-/// BITS_PER_LONG = 8192 − 64`); wireguard-go uses 2048.
+/// How far behind the greatest counter received a counter may be and
+/// still be accepted: a counter `c` is in the window while
+/// `greatest − c ≤ WINDOW_BITS`. This is the Linux kernel's rule and its
+/// number (`COUNTER_WINDOW_SIZE = COUNTER_BITS_TOTAL − BITS_PER_LONG =
+/// 8192 − 64`; `counter_validate` rejects when `COUNTER_WINDOW_SIZE +
+/// their_counter < counter`, with both counters stored plus one), so the
+/// two accept exactly the same sequences of counters below the message
+/// limit — the unit tests compare this window with a transliteration of
+/// the kernel's function. (The limit itself differs by 63: the kernel's
+/// `REJECT_AFTER_MESSAGES` is `2^64 − 8130`, ours the whitepaper's
+/// `2^64 − 2^13 − 1`. No session gets there.) wireguard-go's window is
+/// the same width.
 ///
-/// Raised from 2048 for high-BDP
-/// links: a 500 ms RTT satellite link at 100 Mbit/s has ~4400 packets in
-/// flight, which 2048 cannot cover. The receive-side window size is
-/// purely local (never on the wire), so this has no interop consequence.
+/// The width matters on links with a large bandwidth-delay product: a
+/// 500 ms RTT satellite link at 100 Mbit/s has some 4400 packets in
+/// flight. It is purely local (never on the wire), so it has no interop
+/// consequence.
 ///
-/// With the `+1` redundant word below, the bitmap is 128 × u64 = 8192
-/// bits = 1024 bytes/session — byte-identical to the kernel's
+/// With the redundant word below, the bitmap is 128 × u64 = 8192 bits =
+/// 1024 bytes per session, as the kernel's
 /// `unsigned long backtrack[COUNTER_BITS_TOTAL / BITS_PER_LONG]`.
 pub const WINDOW_BITS: u64 = 8128;
 /// One redundant word beyond the window: when the top slides into a new
 /// word, that word is cleared, and without the spare word the clear would
 /// erase bits of counters still inside the window (RFC 6479's
-/// "bitmap minus one word" rule, same layout as wireguard-go).
+/// "bitmap minus one word" rule). The ring of `WORDS` words always holds
+/// the word of the greatest counter and the 127 before it, which is every
+/// counter down to `greatest − WINDOW_BITS − (greatest mod 64)`: the
+/// whole window, whatever the alignment.
 const WORDS: usize = (WINDOW_BITS / 64) as usize + 1;
 /// `WORDS` as `u64`, so word-index modulo is computed before any
 /// `usize` cast (correct on 32-bit targets even at counter ≥ 2³⁸).
 const WORDS_U64: u64 = WORDS as u64;
 
 /// Sliding bitmap of received counters.
+///
+/// In memory in the order written (`repr(C)`): the two small fields, which
+/// every packet reads, in front of the bitmap rather than wherever a
+/// compiler puts them — which was behind it, a kilobyte away from the
+/// rest of what a packet needs.
 #[derive(Clone, Debug)]
+#[repr(C)]
 pub struct ReplayWindow {
     /// Highest accepted counter (the window covers
-    /// `greatest − WINDOW_BITS + 1 ..= greatest`).
+    /// `greatest − WINDOW_BITS ..= greatest`).
     greatest: u64,
     /// `true` once any counter has been accepted (so counter 0 works).
     primed: bool,
@@ -49,6 +66,10 @@ impl Default for ReplayWindow {
 }
 
 impl ReplayWindow {
+    /// Where the bitmap begins (for the test of the tunnel's layout).
+    #[cfg(test)]
+    pub(crate) const BITMAP_OFFSET: usize = core::mem::offset_of!(Self, bitmap);
+
     /// An empty window: everything below `REJECT_AFTER_MESSAGES` is new.
     #[must_use]
     pub const fn new() -> Self {
@@ -70,7 +91,7 @@ impl ReplayWindow {
         if !self.primed || counter > self.greatest {
             return true;
         }
-        if self.greatest.wrapping_sub(counter) >= WINDOW_BITS {
+        if self.greatest.wrapping_sub(counter) > WINDOW_BITS {
             return false; // too old
         }
         !self.bit(counter)
@@ -92,18 +113,21 @@ impl ReplayWindow {
             return true;
         }
         if counter > self.greatest {
-            // Slide forward: clear every word the jump skips over.
-            let advance = counter.wrapping_sub(self.greatest);
-            if advance >= WINDOW_BITS {
+            // Slide forward: clear every word the top moves into. Words
+            // are used modulo WORDS, so a jump of WORDS words or more
+            // clears them all — and a shorter one must not: the word the
+            // old top was in may still hold counters inside the new
+            // window (the old top itself, when the jump is exactly
+            // WINDOW_BITS).
+            let old_word = self.greatest >> 6;
+            let new_word = counter >> 6;
+            if new_word.wrapping_sub(old_word) >= WORDS_U64 {
                 self.bitmap = [0u64; WORDS];
             } else {
-                // Words are used modulo WORDS; clear the words between the
-                // old and new top, exclusive-old / inclusive-new. The
-                // modulo is taken in u64 BEFORE the usize cast so 32-bit
-                // targets index correctly even at counter ≥ 2^38
-                // (unreachable in practice but cheap to do right).
-                let old_word = self.greatest >> 6;
-                let new_word = counter >> 6;
+                // Exclusive-old / inclusive-new. The modulo is taken in
+                // u64 BEFORE the usize cast so 32-bit targets index
+                // correctly even at counter ≥ 2^38 (unreachable in
+                // practice but cheap to do right).
                 let mut w = old_word.wrapping_add(1);
                 while w <= new_word {
                     if let Some(slot) = self.bitmap.get_mut((w % WORDS_U64) as usize) {
@@ -141,7 +165,12 @@ impl ReplayWindow {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::arithmetic_side_effects, clippy::unwrap_used)]
+    #![allow(
+        clippy::arithmetic_side_effects,
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::int_plus_one // the kernel's own comparison, kept verbatim
+    )]
     use super::*;
     use std::collections::HashSet;
     use std::vec::Vec;
@@ -172,25 +201,60 @@ mod tests {
         let top = WINDOW_BITS * 2; // any value > WINDOW_BITS
         assert!(w.accept(top));
         // Everything within the window, in reverse, never seen: accepted.
-        for c in (top - (WINDOW_BITS - 1)..top).rev() {
+        for c in (top - WINDOW_BITS..top).rev() {
             assert!(w.accept(c), "{c}");
         }
         // All now duplicates.
-        for c in top - (WINDOW_BITS - 1)..=top {
+        for c in top - WINDOW_BITS..=top {
             assert!(!w.accept(c), "{c}");
         }
         // One past the window's left edge: too old.
-        assert!(!w.accept(top - WINDOW_BITS));
+        assert!(!w.accept(top - WINDOW_BITS - 1));
     }
 
+    /// The window's left edge, at every alignment of the greatest counter
+    /// within a bitmap word: a counter exactly `WINDOW_BITS` behind is
+    /// accepted (once), the one before it is not.
     #[test]
     fn window_edges_exactly() {
-        let mut w = ReplayWindow::new();
-        let top = 100_000u64;
-        assert!(w.accept(top));
-        assert!(w.check(top - (WINDOW_BITS - 1)), "oldest in-window");
-        assert!(!w.check(top - WINDOW_BITS), "first out-of-window");
-        assert!(w.accept(top - (WINDOW_BITS - 1)));
+        for top in (100_000u64..100_000 + 130).chain([WINDOW_BITS, WINDOW_BITS + 1]) {
+            let mut w = ReplayWindow::new();
+            assert!(w.accept(top));
+            assert!(w.check(top - WINDOW_BITS), "{top}: oldest in-window");
+            assert!(w.accept(top - WINDOW_BITS), "{top}");
+            assert!(!w.check(top - WINDOW_BITS), "{top}: now a duplicate");
+            if let Some(out) = top.checked_sub(WINDOW_BITS + 1) {
+                assert!(!w.check(out), "{top}: first out-of-window");
+                assert!(!w.accept(out), "{top}");
+            }
+        }
+    }
+
+    /// A jump of exactly the window width keeps the old top in the window
+    /// — and it has been seen: it must not come back as new. (The bitmap
+    /// may only be cleared wholesale for jumps that leave nothing of the
+    /// old window in the new one.)
+    #[test]
+    fn a_jump_of_exactly_the_window_keeps_the_old_top() {
+        for start in [0u64, 1, 63, 64, 65, 5000, 8127, 8128, 8129] {
+            for jump in WINDOW_BITS - 70..=WINDOW_BITS + 70 {
+                let mut w = ReplayWindow::new();
+                assert!(w.accept(start));
+                assert!(w.accept(start + jump), "{start}+{jump}");
+                assert!(
+                    !w.check(start),
+                    "start {start}, jump {jump}: the old top was accepted again"
+                );
+                // A counter next to the old top that was never seen is
+                // new if and only if it is in the window.
+                let neighbour = start + 1;
+                assert_eq!(
+                    w.check(neighbour),
+                    jump - 1 <= WINDOW_BITS && jump > 1,
+                    "start {start}, jump {jump}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -256,7 +320,7 @@ mod tests {
             for c in counters {
                 let model_ok = c < REJECT_AFTER_MESSAGES
                     && !seen.contains(&c)
-                    && greatest.is_none_or(|g| c > g || g - c < WINDOW_BITS);
+                    && greatest.is_none_or(|g| c > g || g - c <= WINDOW_BITS);
                 assert_eq!(w.check(c), model_ok, "check({c}) greatest={greatest:?}");
                 assert_eq!(w.accept(c), model_ok, "accept({c})");
                 if model_ok {
@@ -265,5 +329,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `counter_validate` from the Linux kernel
+    /// (`drivers/net/wireguard/receive.c`), transliterated line by line —
+    /// same variables, same arithmetic, `unsigned long` as `u64`. Returns
+    /// what the kernel returns: whether the counter is accepted.
+    struct KernelCounter {
+        counter: u64,
+        backtrack: [u64; KERNEL_BITS_TOTAL / 64],
+    }
+    const KERNEL_BITS_TOTAL: usize = 8192;
+    const KERNEL_REDUNDANT_BITS: u64 = 64;
+    const KERNEL_WINDOW_SIZE: u64 = KERNEL_BITS_TOTAL as u64 - KERNEL_REDUNDANT_BITS;
+
+    impl KernelCounter {
+        fn new() -> Self {
+            Self {
+                counter: 0,
+                backtrack: [0; KERNEL_BITS_TOTAL / 64],
+            }
+        }
+
+        fn validate(&mut self, mut their_counter: u64) -> bool {
+            if self.counter >= REJECT_AFTER_MESSAGES + 1 || their_counter >= REJECT_AFTER_MESSAGES {
+                return false;
+            }
+            their_counter += 1;
+            if KERNEL_WINDOW_SIZE + their_counter < self.counter {
+                return false;
+            }
+            let mut index = (their_counter >> 6) as usize;
+            if their_counter > self.counter {
+                let index_current = (self.counter >> 6) as usize;
+                let top = (index - index_current).min(KERNEL_BITS_TOTAL / 64);
+                for i in 1..=top {
+                    self.backtrack[(i + index_current) & (KERNEL_BITS_TOTAL / 64 - 1)] = 0;
+                }
+                self.counter = their_counter;
+            }
+            index &= KERNEL_BITS_TOTAL / 64 - 1;
+            let bit = 1u64 << (their_counter & 63);
+            let was_set = self.backtrack[index] & bit != 0;
+            self.backtrack[index] |= bit;
+            !was_set
+        }
+    }
+
+    /// This window and the kernel's accept exactly the same counters, in
+    /// every order: random walks with reordering deeper than the window,
+    /// jumps of every size around the window width and around the size of
+    /// the whole bitmap, and long runs of duplicates.
+    #[test]
+    fn accepts_exactly_what_the_kernel_accepts() {
+        let mut state = 0x6b65_726e_656c_u64;
+        let mut compared = 0u64;
+        let mut accepted = 0u64;
+        for case in 0..400 {
+            let mut ours = ReplayWindow::new();
+            let mut kernel = KernelCounter::new();
+            // Start anywhere, including right at the top of the range.
+            let mut base = match case % 4 {
+                0 => 0,
+                1 => mix(&mut state) % 20_000,
+                2 => mix(&mut state) % (1 << 40),
+                _ => REJECT_AFTER_MESSAGES - 1 - mix(&mut state) % 30_000,
+            };
+            for _ in 0..1500 {
+                let r = mix(&mut state);
+                base = base.saturating_add(match r % 23 {
+                    0 => WINDOW_BITS - 66 + mix(&mut state) % 133, // around the window width
+                    1 => 8192 - 66 + mix(&mut state) % 133,        // around the bitmap size
+                    2 => mix(&mut state) % 100_000,
+                    3..=5 => 0,
+                    _ => r % 5,
+                });
+                let behind = match mix(&mut state) % 7 {
+                    0 => WINDOW_BITS - 3 + mix(&mut state) % 7, // the left edge
+                    1 => mix(&mut state) % (WINDOW_BITS * 2),
+                    2 => 0,
+                    _ => mix(&mut state) % 70,
+                };
+                let c = base.saturating_sub(behind);
+                let expected = kernel.validate(c);
+                assert_eq!(
+                    ours.check(c),
+                    expected,
+                    "case {case}: check({c}) with greatest {}",
+                    ours.greatest()
+                );
+                assert_eq!(ours.accept(c), expected, "case {case}: accept({c})");
+                compared += 1;
+                accepted += u64::from(expected);
+            }
+        }
+        // The walk must have exercised both outcomes thoroughly.
+        assert!(
+            accepted > compared / 4 && accepted < compared * 3 / 4,
+            "{accepted} of {compared} accepted"
+        );
     }
 }

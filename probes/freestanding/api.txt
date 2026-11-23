@@ -1,0 +1,435 @@
+constant	wireguard_sans_io::consts	CONSTRUCTION
+constant	wireguard_sans_io::consts	COOKIE_LIFETIME
+constant	wireguard_sans_io::consts	COOKIE_REPLY_LEN
+constant	wireguard_sans_io::consts	COOKIE_SECRET_GRACE
+constant	wireguard_sans_io::consts	DEAD_PEER_TIMEOUT
+constant	wireguard_sans_io::consts	HANDSHAKE_INITIATION_LEN
+constant	wireguard_sans_io::consts	HANDSHAKE_RESPONSE_LEN
+constant	wireguard_sans_io::consts	IDENTIFIER
+constant	wireguard_sans_io::consts	INITIATIONS_PER_SECOND
+constant	wireguard_sans_io::consts	INITIATION_MIN_INTERVAL
+constant	wireguard_sans_io::consts	KEEPALIVE_LEN
+constant	wireguard_sans_io::consts	KEEPALIVE_TIMEOUT
+constant	wireguard_sans_io::consts	LABEL_COOKIE
+constant	wireguard_sans_io::consts	LABEL_MAC1
+constant	wireguard_sans_io::consts	PADDING_MULTIPLE
+constant	wireguard_sans_io::consts	REJECT_AFTER_MESSAGES
+constant	wireguard_sans_io::consts	REJECT_AFTER_TIME
+constant	wireguard_sans_io::consts	REKEY_AFTER_MESSAGES
+constant	wireguard_sans_io::consts	REKEY_AFTER_TIME
+constant	wireguard_sans_io::consts	REKEY_AFTER_TIME_RECV
+constant	wireguard_sans_io::consts	REKEY_ATTEMPT_TIME
+constant	wireguard_sans_io::consts	REKEY_TIMEOUT
+constant	wireguard_sans_io::consts	REKEY_TIMEOUT_JITTER_MAX
+constant	wireguard_sans_io::consts	SESSION_DISCARD_TIME
+constant	wireguard_sans_io::consts	TRANSPORT_HEADER_LEN
+constant	wireguard_sans_io::consts	TRANSPORT_OVERHEAD
+constant	wireguard_sans_io::consts	UNCONFIRMED_RESPONSE_HOLD
+constant	wireguard_sans_io::crypto::aead	KEY_LEN
+constant	wireguard_sans_io::crypto::aead	MAX_MESSAGE_LEN
+constant	wireguard_sans_io::crypto::aead	TAG_LEN
+constant	wireguard_sans_io::crypto::aead	XNONCE_LEN
+constant	wireguard_sans_io::crypto::x25519	BASEPOINT
+constant	wireguard_sans_io::message	TYPE_COOKIE_REPLY
+constant	wireguard_sans_io::message	TYPE_HANDSHAKE_INITIATION
+constant	wireguard_sans_io::message	TYPE_HANDSHAKE_RESPONSE
+constant	wireguard_sans_io::message	TYPE_TRANSPORT_DATA
+constant	wireguard_sans_io::replay	WINDOW_BITS
+enum	wireguard_sans_io	DropReason
+enum	wireguard_sans_io	Encapsulated
+enum	wireguard_sans_io	Error
+enum	wireguard_sans_io	Incoming
+enum	wireguard_sans_io	PacketKind
+enum	wireguard_sans_io	PollOutput
+enum	wireguard_sans_io	Received
+enum	wireguard_sans_io	SendReason
+enum	wireguard_sans_io	Timer
+enum	wireguard_sans_io::crypto::aead	OpenError
+enum	wireguard_sans_io::message	Packet
+enum	wireguard_sans_io::message	PacketKind
+fn	wireguard_sans_io	const fn padded_len(payload_len: usize, mtu: Option<core::num::NonZeroU16>) -> usize
+fn	wireguard_sans_io	const fn transport_datagram_len(payload_len: usize) -> usize
+fn	wireguard_sans_io	fn ip_packet_addresses(payload: &[u8]) -> Option<(core::net::IpAddr,core::net::IpAddr)>
+fn	wireguard_sans_io	fn ip_packet_len(payload: &[u8]) -> Option<usize>
+fn	wireguard_sans_io	fn peek(datagram: &[u8]) -> Result<PacketKind,crate::error::DropReason>
+fn	wireguard_sans_io::crypto::aead	fn nonce_from_counter(counter: u64) -> [u8;12]
+fn	wireguard_sans_io::crypto::aead	fn open(key: &[u8;32], nonce: &[u8;12], aad: &[u8], ciphertext_and_tag: &[u8], out: &mut [u8]) -> Result<usize,OpenError>
+fn	wireguard_sans_io::crypto::aead	fn open_in_place(key: &[u8;32], nonce: &[u8;12], aad: &[u8], buf: &mut [u8]) -> Result<usize,OpenError>
+fn	wireguard_sans_io::crypto::aead	fn open_in_place_with<C>(key: &[u8;32], nonce: &[u8;12], aad: &[u8], buf: &mut [u8]) -> Result<usize,OpenError>
+fn	wireguard_sans_io::crypto::aead	fn open_with<C>(key: &[u8;32], nonce: &[u8;12], aad: &[u8], ciphertext_and_tag: &[u8], out: &mut [u8]) -> Result<usize,OpenError>
+fn	wireguard_sans_io::crypto::aead	fn seal(key: &[u8;32], nonce: &[u8;12], aad: &[u8], plaintext: &[u8], out: &mut [u8]) -> Result<usize,crate::Error>
+fn	wireguard_sans_io::crypto::aead	fn seal_in_place(key: &[u8;32], nonce: &[u8;12], aad: &[u8], pt_len: usize, buf: &mut [u8]) -> Result<usize,crate::Error>
+fn	wireguard_sans_io::crypto::aead	fn seal_in_place_with<C>(key: &[u8;32], nonce: &[u8;12], aad: &[u8], pt_len: usize, buf: &mut [u8]) -> Result<usize,crate::Error>
+fn	wireguard_sans_io::crypto::aead	fn seal_with<C>(key: &[u8;32], nonce: &[u8;12], aad: &[u8], plaintext: &[u8], out: &mut [u8]) -> Result<usize,crate::Error>
+fn	wireguard_sans_io::crypto::aead	fn xopen(key: &[u8;32], nonce: &[u8;24], aad: &[u8], ciphertext_and_tag: &[u8], out: &mut [u8]) -> Result<usize,OpenError>
+fn	wireguard_sans_io::crypto::aead	fn xopen_in_place(key: &[u8;32], nonce: &[u8;24], aad: &[u8], buf: &mut [u8]) -> Result<usize,OpenError>
+fn	wireguard_sans_io::crypto::aead	fn xseal(key: &[u8;32], nonce: &[u8;24], aad: &[u8], plaintext: &[u8], out: &mut [u8]) -> Result<usize,crate::Error>
+fn	wireguard_sans_io::crypto::aead	fn xseal_in_place(key: &[u8;32], nonce: &[u8;24], aad: &[u8], pt_len: usize, buf: &mut [u8]) -> Result<usize,crate::Error>
+fn	wireguard_sans_io::crypto::blake2s	fn hash(parts: &[&[u8]]) -> [u8;32]
+fn	wireguard_sans_io::crypto::blake2s	fn hash_into(parts: &[&[u8]], out: &mut [u8;32]) -> ()
+fn	wireguard_sans_io::crypto::blake2s	fn mac(key: &[u8], parts: &[&[u8]]) -> [u8;16]
+fn	wireguard_sans_io::crypto::blake2s	fn mac_into(key: &[u8], parts: &[&[u8]], out: &mut [u8;16]) -> ()
+fn	wireguard_sans_io::crypto::blake2s	fn mac_key_state(key: &[u8;32], state: &mut [u32;8]) -> ()
+fn	wireguard_sans_io::crypto::blake2s	fn mac_keyed(key: &[u8;32], state: &[u32;8], parts: &[&[u8]], out: &mut [u8;16]) -> ()
+fn	wireguard_sans_io::crypto::chacha20	fn block(key: &[u8;32], counter: u32, nonce: &[u8;12]) -> [u8;64]
+fn	wireguard_sans_io::crypto::chacha20	fn block_into(key: &[u8;32], counter: u32, nonce: &[u8;12], out: &mut [u8;64]) -> ()
+fn	wireguard_sans_io::crypto::chacha20	fn hchacha20(key: &[u8;32], input: &[u8;16]) -> [u8;32]
+fn	wireguard_sans_io::crypto::chacha20	fn hchacha20_into(key: &[u8;32], input: &[u8;16], out: &mut [u8;32]) -> ()
+fn	wireguard_sans_io::crypto::chacha20	fn one_time_key_into(key: &[u8;32], nonce: &[u8;12], otk: &mut [u8;32]) -> ()
+fn	wireguard_sans_io::crypto::chacha20	fn xor_in_place(key: &[u8;32], counter: u32, nonce: &[u8;12], data: &mut [u8]) -> ()
+fn	wireguard_sans_io::crypto::ct	fn copy_secret<N>(dst: &mut [u8;N], src: &[u8;N]) -> ()
+fn	wireguard_sans_io::crypto::ct	fn ct_eq(a: &[u8], b: &[u8]) -> bool
+fn	wireguard_sans_io::crypto::ct	fn ct_is_zero(a: &[u8]) -> bool
+fn	wireguard_sans_io::crypto::ct	fn scrub_stack_to(low: usize) -> ()
+fn	wireguard_sans_io::crypto::ct	fn stack_mark() -> usize
+fn	wireguard_sans_io::crypto::ct	fn swap_secret<N>(a: &mut [u8;N], b: &mut [u8;N]) -> ()
+fn	wireguard_sans_io::crypto::ct	fn wipe(bytes: &mut [u8]) -> ()
+fn	wireguard_sans_io::crypto::ct	fn wipe_array<N>(bytes: &mut [u8;N]) -> ()
+fn	wireguard_sans_io::crypto::ct	fn wipe_words<T,N>(words: &mut [T;N]) -> ()
+fn	wireguard_sans_io::crypto::kdf	fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8;32]
+fn	wireguard_sans_io::crypto::kdf	fn hmac_into(key: &[u8], parts: &[&[u8]], out: &mut [u8;32]) -> ()
+fn	wireguard_sans_io::crypto::kdf	fn kdf1(key: &[u8;32], input: &[u8]) -> [u8;32]
+fn	wireguard_sans_io::crypto::kdf	fn kdf2(key: &[u8;32], input: &[u8]) -> ([u8;32],[u8;32])
+fn	wireguard_sans_io::crypto::kdf	fn kdf3(key: &[u8;32], input: &[u8]) -> ([u8;32],[u8;32],[u8;32])
+fn	wireguard_sans_io::crypto::kdf	fn kdf_chain<P,N>(chain: &mut [u8;32], input: &[u8], outputs: [&mut [u8;32];N]) -> ()
+fn	wireguard_sans_io::crypto::kdf	fn kdf_into<P,N>(key: &[u8;32], input: &[u8], outputs: [&mut [u8;32];N]) -> ()
+fn	wireguard_sans_io::crypto::poly1305	fn poly1305(key: &[u8;32], data: &[u8]) -> [u8;16]
+fn	wireguard_sans_io::crypto::siphash	const fn key_words(key: &[u8;16]) -> [u64;2]
+fn	wireguard_sans_io::crypto::siphash	const fn siphash24_3(key: [u64;2], msg: [u8;3]) -> u64
+fn	wireguard_sans_io::crypto::siphash	fn siphash24(key: &[u8;16], data: &[u8]) -> u64
+fn	wireguard_sans_io::crypto::x25519	fn clamp_in_place(scalar: &mut [u8;32]) -> ()
+fn	wireguard_sans_io::crypto::x25519	fn clamp_scalar(scalar: [u8;32]) -> [u8;32]
+fn	wireguard_sans_io::crypto::x25519	fn shared_secret(private: &[u8;32], peer_public: &[u8;32]) -> Result<[u8;32],crate::Error>
+fn	wireguard_sans_io::crypto::x25519	fn shared_secret_into(private: &[u8;32], peer_public: &[u8;32], out: &mut [u8;32]) -> bool
+fn	wireguard_sans_io::crypto::x25519	fn x25519(scalar: &[u8;32], u: &[u8;32]) -> [u8;32]
+fn	wireguard_sans_io::crypto::x25519	fn x25519_base(scalar: &[u8;32]) -> [u8;32]
+fn	wireguard_sans_io::crypto::x25519	fn x25519_into(scalar: &[u8;32], u: &[u8;32], out: &mut [u8;32]) -> ()
+fn	wireguard_sans_io::message	fn build_cookie_reply(out: &mut [u8], receiver_index: u32, nonce: &[u8;24], encrypted_cookie: &[u8;32]) -> Result<&mut [u8],crate::error::Error>
+fn	wireguard_sans_io::message	fn build_initiation(out: &mut [u8], sender_index: u32, ephemeral: &[u8;32], encrypted_static: &[u8;48], encrypted_timestamp: &[u8;28]) -> Result<&mut [u8],crate::error::Error>
+fn	wireguard_sans_io::message	fn build_response(out: &mut [u8], sender_index: u32, receiver_index: u32, ephemeral: &[u8;32], encrypted_nothing: &[u8;16]) -> Result<&mut [u8],crate::error::Error>
+fn	wireguard_sans_io::message	fn ip_packet_addresses(payload: &[u8]) -> Option<(core::net::IpAddr,core::net::IpAddr)>
+fn	wireguard_sans_io::message	fn ip_packet_len(payload: &[u8]) -> Option<usize>
+fn	wireguard_sans_io::message	fn mac_slots(msg: &mut [u8]) -> Result<MacSlots<'_>,crate::error::Error>
+fn	wireguard_sans_io::message	fn parse(datagram: &[u8]) -> Result<Packet<'_>,crate::error::DropReason>
+fn	wireguard_sans_io::message	fn peek(datagram: &[u8]) -> Result<PacketKind,crate::error::DropReason>
+fn	wireguard_sans_io::message	fn write_transport_header(out: &mut [u8], receiver_index: u32, counter: u64) -> Result<(),crate::error::Error>
+method	wireguard_sans_io	impl <P> Device<P> :: fn cookie_reply(self: &mut Self, now: Ticks, challenge: &CookieChallenge, out: &mut [u8], rng: &mut dyn EntropySource) -> Result<Transmit<'o>,Error>
+method	wireguard_sans_io	impl <P> Device<P> :: fn identify(self: &Self, initiation: &mut Initiation<'_>) -> Result<PublicKey,DropReason>
+method	wireguard_sans_io	impl <P> Device<P> :: fn public_key(self: &Self) -> PublicKey
+method	wireguard_sans_io	impl <P> Device<P> :: fn receive(self: &mut Self, now: Ticks, src: SocketAddr, under_load: bool, datagram: &mut [u8]) -> Incoming<'d>
+method	wireguard_sans_io	impl <P> Device<P> :: fn receive_for(self: &mut Self, tunnel: &mut Tunnel<P>, now: Ticks, src: SocketAddr, under_load: bool, datagram: &mut [u8], out: &mut [u8], rng: &mut dyn EntropySource) -> Result<Handled<'a>,Error>
+method	wireguard_sans_io	impl <P> Device<P> :: fn set_wall_clock(self: &mut Self, wall_clock: WallClock) -> ()
+method	wireguard_sans_io	impl <P> Device<P> :: fn stats(self: &Self) -> DeviceStats
+method	wireguard_sans_io	impl <P> Device<P> :: fn tunnel(self: &Self, id: PeerId, config: PeerConfig, rng: &mut dyn EntropySource) -> Result<Tunnel<P>,Error>
+method	wireguard_sans_io	impl <P> Device<P> :: fn tunnel_in(self: &Self, slot: &mut Option<Tunnel<P>>, id: PeerId, config: &PeerConfig, rng: &mut dyn EntropySource) -> Result<&mut Tunnel<P>,Error>
+method	wireguard_sans_io	impl <P> Device<P> :: fn with_provider(local_static: StaticSecret, wall_clock: WallClock, rng: &mut dyn EntropySource) -> Result<Self,Error>
+method	wireguard_sans_io	impl <P> Device<P> :: fn with_provider_in(slot: &mut Option<Self>, local_static: &StaticSecret, wall_clock: WallClock, rng: &mut dyn EntropySource) -> Result<&mut Self,Error>
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn encapsulate(self: &mut Self, now: Ticks, payload: &[u8], out: &mut [u8]) -> Result<Encapsulated<'a>,Error>
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn encapsulate_in_place(self: &mut Self, now: Ticks, buf: &mut [u8], payload_len: usize) -> Result<Encapsulated<'a>,Error>
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn endpoint(self: &Self) -> Option<SocketAddr>
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn handle(self: &mut Self, now: Ticks, src: SocketAddr, packet: PeerPacket<'a>) -> Result<Handled<'a>,Error>
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn handle_initiation(self: &mut Self, now: Ticks, initiation: &Initiation<'_>, out: &mut [u8], rng: &mut dyn EntropySource) -> Result<Handled<'a>,Error>
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn is_established(self: &Self, now: Ticks) -> bool
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn mtu(self: &Self) -> Option<NonZeroU16>
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn next_wake(self: &Self) -> Option<Ticks>
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn peer_id(self: &Self) -> PeerId
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn peer_public(self: &Self) -> PublicKey
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn poll(self: &mut Self, now: Ticks, out: &mut [u8], rng: &mut dyn EntropySource) -> Result<PollOutput<'a>,Error>
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn request_handshake(self: &mut Self, now: Ticks) -> ()
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn reset(self: &mut Self) -> ()
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn set_endpoint(self: &mut Self, endpoint: SocketAddr) -> ()
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn set_mtu(self: &mut Self, mtu: Option<NonZeroU16>) -> ()
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn set_wall_clock(self: &mut Self, wall_clock: WallClock) -> ()
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn stats(self: &Self) -> Stats
+method	wireguard_sans_io	impl <P> Tunnel<P> :: fn timer(self: &Self, timer: Timer) -> Option<Ticks>
+method	wireguard_sans_io	impl CookieChallenge :: fn src(self: &Self) -> SocketAddr
+method	wireguard_sans_io	impl Device<crate::crypto::InTree> :: fn new(local_static: StaticSecret, wall_clock: WallClock, rng: &mut dyn EntropySource) -> Result<Self,Error>
+method	wireguard_sans_io	impl Device<crate::crypto::InTree> :: fn new_in(slot: &mut Option<Self>, local_static: &StaticSecret, wall_clock: WallClock, rng: &mut dyn EntropySource) -> Result<&mut Self,Error>
+method	wireguard_sans_io	impl Initiation<'_> :: fn peer_public(self: &Self) -> Option<PublicKey>
+method	wireguard_sans_io	impl Initiation<'_> :: fn sender_index(self: &Self) -> u32
+method	wireguard_sans_io	impl Initiation<'_> :: fn source_verified(self: &Self) -> bool
+method	wireguard_sans_io	impl Initiation<'_> :: fn src(self: &Self) -> SocketAddr
+method	wireguard_sans_io	impl PeerConfig :: fn new(peer_public: PublicKey) -> Self
+method	wireguard_sans_io	impl PeerId :: const fn get(self: Self) -> u32
+method	wireguard_sans_io	impl PeerId :: const fn new(value: u32) -> Option<Self>
+method	wireguard_sans_io	impl PeerPacket<'_> :: fn is_handshake(self: &Self) -> bool
+method	wireguard_sans_io	impl PeerPacket<'_> :: fn source_verified(self: &Self) -> bool
+method	wireguard_sans_io	impl PresharedKey :: const fn from_bytes(bytes: [u8;32]) -> Self
+method	wireguard_sans_io	impl PresharedKey :: fn generate(rng: &mut dyn EntropySource) -> Result<Self,Error>
+method	wireguard_sans_io	impl PublicKey :: const fn as_bytes(self: &Self) -> &[u8;32]
+method	wireguard_sans_io	impl PublicKey :: const fn from_bytes(bytes: [u8;32]) -> Self
+method	wireguard_sans_io	impl Received<'_> :: fn is_authenticated(self: &Self) -> bool
+method	wireguard_sans_io	impl StaticSecret :: const fn from_bytes(bytes: [u8;32]) -> Self
+method	wireguard_sans_io	impl StaticSecret :: fn generate(rng: &mut dyn EntropySource) -> Result<Self,Error>
+method	wireguard_sans_io	impl StaticSecret :: fn public_key(self: &Self) -> PublicKey
+method	wireguard_sans_io	impl StaticSecret :: fn public_key_with<P>(self: &Self) -> PublicKey
+method	wireguard_sans_io	impl Tai64N :: const fn as_bytes(self: &Self) -> &[u8;12]
+method	wireguard_sans_io	impl Tai64N :: const fn from_bytes(bytes: [u8;12]) -> Self
+method	wireguard_sans_io	impl Tai64N :: const fn from_unix(unix_secs: u64, unix_nanos: u32) -> Self
+method	wireguard_sans_io	impl Tai64N :: fn tick(self: Self) -> Self
+method	wireguard_sans_io	impl Ticks :: const fn add_nanos(self: Self, nanos: u64) -> Self
+method	wireguard_sans_io	impl Ticks :: const fn from_nanos(nanos: u64) -> Self
+method	wireguard_sans_io	impl Ticks :: const fn from_secs(secs: u64) -> Self
+method	wireguard_sans_io	impl Ticks :: const fn max(self: Self, other: Self) -> Self
+method	wireguard_sans_io	impl Ticks :: const fn min(self: Self, other: Self) -> Self
+method	wireguard_sans_io	impl Ticks :: const fn nanos(self: Self) -> u64
+method	wireguard_sans_io	impl Ticks :: const fn since(self: Self, earlier: Self) -> u64
+method	wireguard_sans_io	impl WallClock :: const fn new(at: Ticks, unix_secs: u64, unix_nanos: u32) -> Self
+method	wireguard_sans_io	impl WallClock :: const fn tai64n(self: &Self, now: Ticks) -> Tai64N
+method	wireguard_sans_io	impl WallClock :: const fn unix_at(self: &Self, now: Ticks) -> (u64,u32)
+method	wireguard_sans_io::crypto::blake2s	impl Blake2s256 :: fn finalize(self: Self) -> [u8;32]
+method	wireguard_sans_io::crypto::blake2s	impl Blake2s256 :: fn finalize_into(self: &mut Self, out: &mut [u8;32]) -> ()
+method	wireguard_sans_io::crypto::blake2s	impl Blake2s256 :: fn new() -> Self
+method	wireguard_sans_io::crypto::blake2s	impl Blake2s256 :: fn update(self: &mut Self, data: &[u8]) -> &mut Self
+method	wireguard_sans_io::crypto::blake2s	impl Blake2sMac<'k> :: fn finalize(self: Self) -> [u8;16]
+method	wireguard_sans_io::crypto::blake2s	impl Blake2sMac<'k> :: fn finalize_into(self: &mut Self, out: &mut [u8;16]) -> ()
+method	wireguard_sans_io::crypto::blake2s	impl Blake2sMac<'k> :: fn new(key: &[u8]) -> Self
+method	wireguard_sans_io::crypto::blake2s	impl Blake2sMac<'k> :: fn update(self: &mut Self, data: &[u8]) -> &mut Self
+method	wireguard_sans_io::crypto::ct	impl ScrubOnDrop :: const fn new() -> Self
+method	wireguard_sans_io::crypto::ct	impl ScrubOnDrop :: fn low(self: &mut Self) -> &mut usize
+method	wireguard_sans_io::crypto::poly1305	impl Poly1305 :: fn finalize(self: Self) -> [u8;16]
+method	wireguard_sans_io::crypto::poly1305	impl Poly1305 :: fn finalize_into(self: &mut Self, out: &mut [u8;16]) -> ()
+method	wireguard_sans_io::crypto::poly1305	impl Poly1305 :: fn new(key: &[u8;32]) -> Self
+method	wireguard_sans_io::crypto::poly1305	impl Poly1305 :: fn update(self: &mut Self, data: &[u8]) -> &mut Self
+method	wireguard_sans_io::crypto::poly1305	impl Poly1305 :: fn update_padded(self: &mut Self, data: &[u8]) -> &mut Self
+method	wireguard_sans_io::replay	impl ReplayWindow :: const fn new() -> Self
+method	wireguard_sans_io::replay	impl ReplayWindow :: fn accept(self: &mut Self, counter: u64) -> bool
+method	wireguard_sans_io::replay	impl ReplayWindow :: fn check(self: &Self, counter: u64) -> bool
+method	wireguard_sans_io::replay	impl ReplayWindow :: fn greatest(self: &Self) -> u64
+method	wireguard_sans_io::testing	impl DeterministicRng :: fn new(seed: u64) -> Self
+method	wireguard_sans_io::testing	impl DeterministicRng :: fn next_u64(self: &mut Self) -> u64
+struct	wireguard_sans_io	CookieChallenge
+struct	wireguard_sans_io	Device
+struct	wireguard_sans_io	DeviceStats
+struct	wireguard_sans_io	EntropyError
+struct	wireguard_sans_io	Handled
+struct	wireguard_sans_io	InTree
+struct	wireguard_sans_io	Initiation
+struct	wireguard_sans_io	PeerConfig
+struct	wireguard_sans_io	PeerId
+struct	wireguard_sans_io	PeerPacket
+struct	wireguard_sans_io	PresharedKey
+struct	wireguard_sans_io	PublicKey
+struct	wireguard_sans_io	Scalar
+struct	wireguard_sans_io	StaticSecret
+struct	wireguard_sans_io	Stats
+struct	wireguard_sans_io	Tai64N
+struct	wireguard_sans_io	Ticks
+struct	wireguard_sans_io	Transmit
+struct	wireguard_sans_io	Tunnel
+struct	wireguard_sans_io	WallClock
+struct	wireguard_sans_io::crypto	InTree
+struct	wireguard_sans_io::crypto::blake2s	Blake2s256
+struct	wireguard_sans_io::crypto::blake2s	Blake2sMac
+struct	wireguard_sans_io::crypto::chacha20	Scalar
+struct	wireguard_sans_io::crypto::ct	ScrubOnDrop
+struct	wireguard_sans_io::crypto::poly1305	Poly1305
+struct	wireguard_sans_io::message	CookieReply
+struct	wireguard_sans_io::message	HandshakeInitiation
+struct	wireguard_sans_io::message	HandshakeResponse
+struct	wireguard_sans_io::message	MacSlots
+struct	wireguard_sans_io::message	TransportData
+struct	wireguard_sans_io::replay	ReplayWindow
+struct	wireguard_sans_io::testing	DeterministicRng
+struct	wireguard_sans_io::testing	FailingRng
+trait	wireguard_sans_io	ChaChaImpl
+trait	wireguard_sans_io	CryptoProvider
+trait	wireguard_sans_io	EntropySource
+trait	wireguard_sans_io::crypto	CryptoProvider
+trait	wireguard_sans_io::crypto::chacha20	ChaChaImpl
+trait_impl	wireguard_sans_io	impl <C> Clone for InTree<C> {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl <C> Copy for InTree<C> {} provided {}
+trait_impl	wireguard_sans_io	impl <C> CryptoProvider for InTree<C> {name,x25519_public,x25519,hash,mac,mac_prepare,mac_prepared,hmac,seal_in_place,open_in_place,xseal_in_place,xopen_in_place} provided {mac_prepare,mac_prepared}
+trait_impl	wireguard_sans_io	impl <C> Debug for InTree<C> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl <C> Default for InTree<C> {default} provided {}
+trait_impl	wireguard_sans_io	impl <P> Debug for Device<P> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl <P> Debug for Tunnel<P> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl ChaChaImpl for Scalar {apply_keystream,seal_keystream,open_keystream,name} provided {open_keystream,seal_keystream}
+trait_impl	wireguard_sans_io	impl Clone for CookieChallenge {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for DeviceStats {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for DropReason {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for EntropyError {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for Error {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for PacketKind {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for PeerId {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for PresharedKey {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for PublicKey {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for Scalar {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for SendReason {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for StaticSecret {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for Stats {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for Tai64N {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for Ticks {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for Timer {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for Transmit<'a> {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Clone for WallClock {clone} provided {clone_from}
+trait_impl	wireguard_sans_io	impl Copy for CookieChallenge {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for DeviceStats {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for DropReason {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for EntropyError {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for Error {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for PacketKind {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for PeerId {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for PublicKey {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for Scalar {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for SendReason {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for Stats {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for Tai64N {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for Ticks {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for Timer {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for Transmit<'a> {} provided {}
+trait_impl	wireguard_sans_io	impl Copy for WallClock {} provided {}
+trait_impl	wireguard_sans_io	impl Debug for CookieChallenge {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for DeviceStats {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for DropReason {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Encapsulated<'a> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for EntropyError {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Error {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Handled<'a> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Incoming<'d> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Initiation<'_> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for PacketKind {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for PeerConfig {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for PeerId {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for PeerPacket<'d> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for PollOutput<'a> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for PresharedKey {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for PublicKey {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Received<'_> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Scalar {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for SendReason {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for StaticSecret {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Stats {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Tai64N {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Ticks {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Timer {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for Transmit<'_> {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for WallClock {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Default for DeviceStats {default} provided {}
+trait_impl	wireguard_sans_io	impl Default for PresharedKey {default} provided {}
+trait_impl	wireguard_sans_io	impl Default for Scalar {default} provided {}
+trait_impl	wireguard_sans_io	impl Default for Stats {default} provided {}
+trait_impl	wireguard_sans_io	impl Default for Ticks {default} provided {}
+trait_impl	wireguard_sans_io	impl Display for DropReason {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Display for EntropyError {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Display for Error {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Drop for PresharedKey {drop} provided {drop,pin_drop}
+trait_impl	wireguard_sans_io	impl Drop for StaticSecret {drop} provided {drop,pin_drop}
+trait_impl	wireguard_sans_io	impl Eq for CookieChallenge {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for DeviceStats {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for DropReason {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for EntropyError {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for Error {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for PacketKind {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for PeerId {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for PublicKey {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for SendReason {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for Stats {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for Tai64N {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for Ticks {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for Timer {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for Transmit<'a> {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Eq for WallClock {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io	impl Error for EntropyError {} provided {cause,description,provide,source,type_id}
+trait_impl	wireguard_sans_io	impl Error for Error {} provided {cause,description,provide,source,type_id}
+trait_impl	wireguard_sans_io	impl From<[u8;32]> for PresharedKey {from} provided {}
+trait_impl	wireguard_sans_io	impl From<[u8;32]> for PublicKey {from} provided {}
+trait_impl	wireguard_sans_io	impl From<[u8;32]> for StaticSecret {from} provided {}
+trait_impl	wireguard_sans_io	impl Hash for DropReason {hash} provided {hash_slice}
+trait_impl	wireguard_sans_io	impl Hash for Error {hash} provided {hash_slice}
+trait_impl	wireguard_sans_io	impl Hash for PeerId {hash} provided {hash_slice}
+trait_impl	wireguard_sans_io	impl Hash for PublicKey {hash} provided {hash_slice}
+trait_impl	wireguard_sans_io	impl Hash for Tai64N {hash} provided {hash_slice}
+trait_impl	wireguard_sans_io	impl Hash for Ticks {hash} provided {hash_slice}
+trait_impl	wireguard_sans_io	impl Hash for Timer {hash} provided {hash_slice}
+trait_impl	wireguard_sans_io	impl Ord for PeerId {cmp} provided {clamp,clamp_to,max,min}
+trait_impl	wireguard_sans_io	impl Ord for PublicKey {cmp} provided {clamp,clamp_to,max,min}
+trait_impl	wireguard_sans_io	impl Ord for Tai64N {cmp} provided {clamp,clamp_to,max,min}
+trait_impl	wireguard_sans_io	impl Ord for Ticks {cmp} provided {clamp,clamp_to,max,min}
+trait_impl	wireguard_sans_io	impl PartialEq for CookieChallenge {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for DeviceStats {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for DropReason {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for EntropyError {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for Error {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for PacketKind {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for PeerId {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for PublicKey {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for SendReason {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for Stats {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for Tai64N {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for Ticks {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for Timer {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for Transmit<'a> {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialEq for WallClock {eq} provided {ne}
+trait_impl	wireguard_sans_io	impl PartialOrd for PeerId {partial_cmp} provided {__chaining_greater,__chaining_less,ge,gt,le,lt}
+trait_impl	wireguard_sans_io	impl PartialOrd for PublicKey {partial_cmp} provided {__chaining_greater,__chaining_less,ge,gt,le,lt}
+trait_impl	wireguard_sans_io	impl PartialOrd for Tai64N {partial_cmp} provided {__chaining_greater,__chaining_less,ge,gt,le,lt}
+trait_impl	wireguard_sans_io	impl PartialOrd for Ticks {partial_cmp} provided {__chaining_greater,__chaining_less,ge,gt,le,lt}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for CookieChallenge {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for DeviceStats {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for DropReason {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for EntropyError {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for Error {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for PacketKind {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for PeerId {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for PublicKey {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for SendReason {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for Stats {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for Tai64N {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for Ticks {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for Timer {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for Transmit<'a> {} provided {}
+trait_impl	wireguard_sans_io	impl StructuralPartialEq for WallClock {} provided {}
+trait_impl	wireguard_sans_io::crypto	impl <C> Clone for InTree<C> {clone} provided {clone_from}
+trait_impl	wireguard_sans_io::crypto	impl <C> Copy for InTree<C> {} provided {}
+trait_impl	wireguard_sans_io::crypto	impl <C> CryptoProvider for InTree<C> {name,x25519_public,x25519,hash,mac,mac_prepare,mac_prepared,hmac,seal_in_place,open_in_place,xseal_in_place,xopen_in_place} provided {mac_prepare,mac_prepared}
+trait_impl	wireguard_sans_io::crypto	impl <C> Debug for InTree<C> {fmt} provided {}
+trait_impl	wireguard_sans_io::crypto	impl <C> Default for InTree<C> {default} provided {}
+trait_impl	wireguard_sans_io::crypto::aead	impl Clone for OpenError {clone} provided {clone_from}
+trait_impl	wireguard_sans_io::crypto::aead	impl Copy for OpenError {} provided {}
+trait_impl	wireguard_sans_io::crypto::aead	impl Debug for OpenError {fmt} provided {}
+trait_impl	wireguard_sans_io::crypto::aead	impl Display for OpenError {fmt} provided {}
+trait_impl	wireguard_sans_io::crypto::aead	impl Eq for OpenError {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io::crypto::aead	impl Error for OpenError {} provided {cause,description,provide,source,type_id}
+trait_impl	wireguard_sans_io::crypto::aead	impl Hash for OpenError {hash} provided {hash_slice}
+trait_impl	wireguard_sans_io::crypto::aead	impl PartialEq for OpenError {eq} provided {ne}
+trait_impl	wireguard_sans_io::crypto::aead	impl StructuralPartialEq for OpenError {} provided {}
+trait_impl	wireguard_sans_io::crypto::blake2s	impl Clone for Blake2s256 {clone} provided {clone_from}
+trait_impl	wireguard_sans_io::crypto::blake2s	impl Clone for Blake2sMac<'k> {clone} provided {clone_from}
+trait_impl	wireguard_sans_io::crypto::blake2s	impl Debug for Blake2s256 {fmt} provided {}
+trait_impl	wireguard_sans_io::crypto::blake2s	impl Debug for Blake2sMac<'_> {fmt} provided {}
+trait_impl	wireguard_sans_io::crypto::blake2s	impl Default for Blake2s256 {default} provided {}
+trait_impl	wireguard_sans_io::crypto::chacha20	impl ChaChaImpl for Scalar {apply_keystream,seal_keystream,open_keystream,name} provided {open_keystream,seal_keystream}
+trait_impl	wireguard_sans_io::crypto::chacha20	impl Clone for Scalar {clone} provided {clone_from}
+trait_impl	wireguard_sans_io::crypto::chacha20	impl Copy for Scalar {} provided {}
+trait_impl	wireguard_sans_io::crypto::chacha20	impl Debug for Scalar {fmt} provided {}
+trait_impl	wireguard_sans_io::crypto::chacha20	impl Default for Scalar {default} provided {}
+trait_impl	wireguard_sans_io::crypto::ct	impl Debug for ScrubOnDrop {fmt} provided {}
+trait_impl	wireguard_sans_io::crypto::ct	impl Default for ScrubOnDrop {default} provided {}
+trait_impl	wireguard_sans_io::crypto::ct	impl Drop for ScrubOnDrop {drop} provided {drop,pin_drop}
+trait_impl	wireguard_sans_io::crypto::poly1305	impl Clone for Poly1305 {clone} provided {clone_from}
+trait_impl	wireguard_sans_io::crypto::poly1305	impl Debug for Poly1305 {fmt} provided {}
+trait_impl	wireguard_sans_io::crypto::poly1305	impl Drop for Poly1305 {drop} provided {drop,pin_drop}
+trait_impl	wireguard_sans_io::message	impl Clone for PacketKind {clone} provided {clone_from}
+trait_impl	wireguard_sans_io::message	impl Copy for PacketKind {} provided {}
+trait_impl	wireguard_sans_io::message	impl Debug for CookieReply<'a> {fmt} provided {}
+trait_impl	wireguard_sans_io::message	impl Debug for HandshakeInitiation<'a> {fmt} provided {}
+trait_impl	wireguard_sans_io::message	impl Debug for HandshakeResponse<'a> {fmt} provided {}
+trait_impl	wireguard_sans_io::message	impl Debug for MacSlots<'a> {fmt} provided {}
+trait_impl	wireguard_sans_io::message	impl Debug for Packet<'a> {fmt} provided {}
+trait_impl	wireguard_sans_io::message	impl Debug for PacketKind {fmt} provided {}
+trait_impl	wireguard_sans_io::message	impl Debug for TransportData<'a> {fmt} provided {}
+trait_impl	wireguard_sans_io::message	impl Eq for PacketKind {} provided {assert_fields_are_eq,assert_receiver_is_total_eq}
+trait_impl	wireguard_sans_io::message	impl PartialEq for PacketKind {eq} provided {ne}
+trait_impl	wireguard_sans_io::message	impl StructuralPartialEq for PacketKind {} provided {}
+trait_impl	wireguard_sans_io::replay	impl Clone for ReplayWindow {clone} provided {clone_from}
+trait_impl	wireguard_sans_io::replay	impl Debug for ReplayWindow {fmt} provided {}
+trait_impl	wireguard_sans_io::replay	impl Default for ReplayWindow {default} provided {}
+trait_impl	wireguard_sans_io::testing	impl Clone for DeterministicRng {clone} provided {clone_from}
+trait_impl	wireguard_sans_io::testing	impl Clone for FailingRng {clone} provided {clone_from}
+trait_impl	wireguard_sans_io::testing	impl Copy for FailingRng {} provided {}
+trait_impl	wireguard_sans_io::testing	impl Debug for DeterministicRng {fmt} provided {}
+trait_impl	wireguard_sans_io::testing	impl Debug for FailingRng {fmt} provided {}
+trait_impl	wireguard_sans_io::testing	impl Default for FailingRng {default} provided {}
+trait_impl	wireguard_sans_io::testing	impl EntropySource for DeterministicRng {fill} provided {gen32}
+trait_impl	wireguard_sans_io::testing	impl EntropySource for FailingRng {fill} provided {gen32}

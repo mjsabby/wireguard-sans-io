@@ -15,6 +15,33 @@ impl EntropySource for OsEntropy {
     }
 }
 
+/// What a [`crate::Tunn`] draws from: [`OsEntropy`] — which this crate's
+/// own tests can switch off, to see what the driver does when the
+/// operating system has none to give.
+#[derive(Debug, Default)]
+pub(crate) struct TunnEntropy {
+    #[cfg(test)]
+    broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl EntropySource for TunnEntropy {
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), EntropyError> {
+        #[cfg(test)]
+        if self.broken.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(EntropyError);
+        }
+        OsEntropy.fill(buf)
+    }
+}
+
+#[cfg(all(test, feature = "async"))]
+impl TunnEntropy {
+    /// While this is `true`, every draw fails.
+    pub(crate) fn switch(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.broken)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

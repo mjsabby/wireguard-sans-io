@@ -1,0 +1,41 @@
+# Checks that have to look at memory or at compiled objects, which the main
+# package cannot host: it forbids `unsafe` for every one of its targets,
+# and reading dead stack memory or a value's raw bytes needs it.
+#
+#   stack_residue    which secrets are still readable in dead stack memory
+#                    after a public call of the core has returned
+#   memory_residue   which of them are still inside a Tunnel or Device at
+#                    each stage of their life, and after they are dropped
+#   driver_residue   what creating and dropping a `wireguard-embed` tunnel
+#                    leaves of its keys on the stack
+#   constant_flow    one secret-handling operation on one secret, for
+#                    `scripts/check_constant_flow.sh` to count the basic
+#                    blocks of
+#
+# `scripts/check_secret_residue.sh` runs the first three, in an
+# unoptimised build and in the dev and the release profile.
+[package]
+name = "wireguard-probes"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone on purpose (not a member of the main workspace).
+[workspace]
+
+[dependencies]
+wireguard-sans-io = { path = ".." }
+# The keystream `wireguard-embed` uses: what a tunnel leaves on the stack
+# is measured with it as well as with the default provider.
+wireguard-chacha-simd = { path = "../simd" }
+# The driver itself, for `driver_residue`.
+wireguard-embed = { path = "../embed" }
+
+# The same optimisation settings as the main workspace: stack layout — and
+# with it what is left on the stack — depends on them.
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

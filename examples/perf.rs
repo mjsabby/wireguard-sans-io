@@ -24,12 +24,72 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use wireguard_sans_io::crypto::{aead, blake2s, chacha20, poly1305, x25519};
-use wireguard_sans_io::testing::DeterministicRng;
-use wireguard_sans_io::{Config, Encapsulated, Now, Received, StaticSecret, Tunnel};
+use std::net::SocketAddr;
 
-fn now(mono: u64) -> Now {
-    Now::new(mono, 1_700_000_000 + mono / 1_000_000_000, 0)
+use wireguard_sans_io::crypto::{aead, blake2s, chacha20, poly1305, siphash, x25519};
+use wireguard_sans_io::testing::DeterministicRng;
+use wireguard_sans_io::{
+    Device, Encapsulated, Incoming, PeerConfig, PeerId, PollOutput, Received, StaticSecret, Ticks,
+    Tunnel, WallClock,
+};
+
+fn now(mono: u64) -> Ticks {
+    Ticks::from_nanos(mono)
+}
+
+// Built, not parsed: these are called inside the timed loops, where
+// parsing a string would be a fifth of what routing a datagram costs.
+fn a_addr() -> SocketAddr {
+    SocketAddr::from(([192, 0, 2, 1], 51820))
+}
+
+fn b_addr() -> SocketAddr {
+    SocketAddr::from(([192, 0, 2, 2], 51820))
+}
+
+/// One endpoint: a device and its single tunnel.
+struct Side {
+    device: Device,
+    tunnel: Tunnel,
+}
+
+impl Side {
+    fn new(
+        key: StaticSecret,
+        peer: wireguard_sans_io::PublicKey,
+        peer_addr: SocketAddr,
+        rng: &mut DeterministicRng,
+    ) -> Self {
+        let wall = WallClock::new(Ticks::ZERO, 1_700_000_000, 0);
+        let device = Device::new(key, wall, rng).unwrap();
+        let mut cfg = PeerConfig::new(peer);
+        cfg.endpoint = Some(peer_addr);
+        let tunnel = device.tunnel(PeerId::new(0).unwrap(), cfg, rng).unwrap();
+        Self { device, tunnel }
+    }
+
+    /// Deliver a datagram (decrypting transport data in place).
+    fn deliver<'a>(
+        &mut self,
+        t: Ticks,
+        from: SocketAddr,
+        datagram: &'a mut [u8],
+        out: &'a mut [u8],
+        rng: &mut DeterministicRng,
+    ) -> Received<'a> {
+        self.device
+            .receive_for(&mut self.tunnel, t, from, false, datagram, out, rng)
+            .unwrap()
+            .received
+    }
+
+    fn poll(&mut self, t: Ticks, rng: &mut DeterministicRng) -> Vec<u8> {
+        let mut buf = [0u8; 256];
+        match self.tunnel.poll(t, &mut buf, rng).unwrap() {
+            PollOutput::Transmit(tx, _) => tx.datagram.to_vec(),
+            other => unreachable!("{other:?}"),
+        }
+    }
 }
 
 /// Measure `f` for ~`target_ms`, returning (iterations, seconds).
@@ -66,26 +126,32 @@ fn throughput(label: &str, bytes_per_iter: usize, target_ms: u64, f: impl FnMut(
     );
 }
 
-fn established_pair(rng: &mut DeterministicRng) -> (Tunnel, Tunnel) {
+fn established_pair(rng: &mut DeterministicRng) -> (Side, Side) {
     let a_key = StaticSecret::generate(rng).unwrap();
     let b_key = StaticSecret::generate(rng).unwrap();
     let a_pub = a_key.public_key();
     let b_pub = b_key.public_key();
-    let mut a = Tunnel::new(Config::new(a_key, b_pub)).unwrap();
-    let mut b = Tunnel::new(Config::new(b_key, a_pub)).unwrap();
+    let mut a = Side::new(a_key, b_pub, b_addr(), rng);
+    let mut b = Side::new(b_key, a_pub, a_addr(), rng);
     let t = now(0);
-    let (mut w, mut s) = ([0u8; 2048], [0u8; 2048]);
-    let init = a.initiate_handshake(t, &mut w, rng).unwrap().to_vec();
-    let resp = match b.decapsulate(t, b"", false, &init, &mut s, rng).unwrap() {
-        Received::Reply(r) => r.to_vec(),
+    let mut out = [0u8; 128];
+    a.tunnel.request_handshake(t);
+    let mut init = a.poll(t, rng);
+    let mut resp = match b.deliver(t, a_addr(), &mut init, &mut out, rng) {
+        Received::HandshakeResponse(tx) => tx.datagram.to_vec(),
         _ => unreachable!(),
     };
-    a.decapsulate(t, b"", false, &resp, &mut s, rng).unwrap();
-    let data = match a.encapsulate(t, b"confirm", &mut w, rng).unwrap() {
-        Encapsulated::Transport(d) => d.to_vec(),
-        _ => unreachable!(),
-    };
-    b.decapsulate(t, b"", false, &data, &mut s, rng).unwrap();
+    let mut out = [0u8; 128];
+    assert!(matches!(
+        a.deliver(t, b_addr(), &mut resp, &mut out, rng),
+        Received::HandshakeComplete
+    ));
+    // A's confirming keepalive makes the session usable for B too.
+    let mut confirm = a.poll(t, rng);
+    assert!(matches!(
+        b.deliver(t, a_addr(), &mut confirm, &mut out, rng),
+        Received::Keepalive
+    ));
     (a, b)
 }
 
@@ -109,6 +175,9 @@ fn main() {
     throughput("poly1305 (1 KiB)", 1024, ms, || {
         black_box(poly1305::poly1305(&key, &data_1k));
     });
+    rate("siphash-2-4 (8 B, index codec round)", "op", ms, || {
+        black_box(siphash::siphash24(&[7u8; 16], black_box(&[1u8; 8])));
+    });
     throughput("chacha20poly1305 seal (1 KiB)", 1024, ms, {
         let mut out = [0u8; 1024 + 16];
         move || {
@@ -129,35 +198,63 @@ fn main() {
 
     println!("\n== handshake ==");
     rate(
-        "full 1-RTT handshake (both sides, 4 msgs)",
+        "full 1-RTT handshake (both sides, incl. setup)",
         "handshake",
         ms,
         || {
             let (a, b) = established_pair(&mut rng);
-            black_box((a, b));
+            black_box((a.tunnel, b.tunnel));
         },
     );
+
+    println!("\n== routing ==");
+    {
+        // What `Device::receive` costs for a transport datagram: parse the
+        // header and decode the receiver index to a peer id. No table.
+        let (mut a, mut b) = established_pair(&mut rng);
+        let mut wire = vec![0u8; 256];
+        let n = match a
+            .tunnel
+            .encapsulate(now(1), &[0xddu8; 64], &mut wire)
+            .unwrap()
+        {
+            Encapsulated::Transport(tx) => tx.datagram.len(),
+            _ => unreachable!(),
+        };
+        rate(
+            "device.receive: route a transport datagram",
+            "op",
+            ms,
+            || match b
+                .device
+                .receive(now(1), a_addr(), false, black_box(&mut wire[..n]))
+            {
+                Incoming::ForPeer(id, _) => {
+                    black_box(id);
+                }
+                _ => unreachable!(),
+            },
+        );
+    }
 
     println!("\n== transport ==");
     for (label, size) in [("64 B", 64usize), ("1420 B (typical MTU)", 1420)] {
         let (mut a, mut b) = established_pair(&mut rng);
         let payload = vec![0xddu8; size];
         let mut wire = vec![0u8; size + 64];
-        let mut out = vec![0u8; size + 64];
+        let mut out = [0u8; 128];
         let mut mono = 1_000_000u64;
-        throughput(&format!("encapsulate+decapsulate ({label})"), size, ms, {
+        throughput(&format!("encapsulate+receive ({label})"), size, ms, {
             let rng = &mut rng;
             move || {
                 mono += 1000;
                 let t = now(mono);
-                let n = match a.encapsulate(t, &payload, &mut wire, rng).unwrap() {
-                    Encapsulated::Transport(w) => w.len(),
+                let n = match a.tunnel.encapsulate(t, &payload, &mut wire).unwrap() {
+                    Encapsulated::Transport(tx) => tx.datagram.len(),
                     _ => unreachable!(),
                 };
-                match b
-                    .decapsulate(t, b"", false, &wire[..n], &mut out, rng)
-                    .unwrap()
-                {
+                // Routed by the device, decrypted in place by the tunnel.
+                match b.deliver(t, a_addr(), &mut wire[..n], &mut out, rng) {
                     Received::Data(d) => {
                         black_box(d);
                     }
@@ -172,21 +269,43 @@ fn main() {
         let payload = vec![0xddu8; 1420];
         let mut wire = vec![0u8; 2048];
         let mut mono = 1_000_000u64;
-        throughput("encapsulate only (1420 B)", 1420, ms, {
-            let rng = &mut rng;
-            move || {
-                mono += 1000;
-                match a.encapsulate(now(mono), &payload, &mut wire, rng).unwrap() {
-                    Encapsulated::Transport(w) => {
-                        black_box(w);
-                    }
-                    _ => unreachable!(),
+        throughput("encapsulate only (1420 B)", 1420, ms, move || {
+            mono += 1000;
+            match a
+                .tunnel
+                .encapsulate(now(mono), &payload, &mut wire)
+                .unwrap()
+            {
+                Encapsulated::Transport(tx) => {
+                    black_box(tx.datagram);
                 }
+                _ => unreachable!(),
             }
         });
     }
     {
-        // Decapsulate-only: pre-encrypt a batch, then time pure decryption.
+        // The zero-copy send path: the payload is already in the buffer,
+        // 16 bytes in.
+        let (mut a, _b) = established_pair(&mut rng);
+        let mut wire = vec![0xddu8; 2048];
+        let mut mono = 1_000_000u64;
+        throughput("encapsulate_in_place only (1420 B)", 1420, ms, move || {
+            mono += 1000;
+            match a
+                .tunnel
+                .encapsulate_in_place(now(mono), &mut wire, 1420)
+                .unwrap()
+            {
+                Encapsulated::Transport(tx) => {
+                    black_box(tx.datagram);
+                }
+                _ => unreachable!(),
+            }
+        });
+    }
+    {
+        // Receive-only: pre-encrypt a batch, then time routing plus
+        // in-place decryption.
         let (mut a, mut b) = established_pair(&mut rng);
         let payload = vec![0xddu8; 1420];
         let mut batch = Vec::new();
@@ -194,30 +313,49 @@ fn main() {
         for _ in 0..200_000 {
             mono += 1000;
             let mut w = vec![0u8; 2048];
-            let n = match b
-                .encapsulate(now(mono), &payload, &mut w, &mut rng)
-                .unwrap()
-            {
-                Encapsulated::Transport(t) => t.len(),
+            let n = match b.tunnel.encapsulate(now(mono), &payload, &mut w).unwrap() {
+                Encapsulated::Transport(tx) => tx.datagram.len(),
                 _ => unreachable!(),
             };
             w.truncate(n);
             batch.push(w);
         }
-        let mut i = 0usize;
-        let mut out = vec![0u8; 2048];
-        throughput("decapsulate only (1420 B)", 1420, ms.min(150), {
+        // A packet can be received once, so every timed iteration needs
+        // one of its own. If the machine is fast enough to use them all
+        // up, the iterations after that would do nothing and the figure
+        // would be too good: say so instead of printing it.
+        let next = std::cell::Cell::new(0usize);
+        let ran_out = std::cell::Cell::new(false);
+        let mut out = [0u8; 128];
+        let (iters, secs) = measure(ms.min(150), {
             let rng = &mut rng;
-            move || {
-                if i < batch.len() {
-                    let _ = a
-                        .decapsulate(now(mono), b"", false, &batch[i], &mut out, rng)
-                        .unwrap();
-                    i += 1;
+            let (next, ran_out) = (&next, &ran_out);
+            move || match batch.get_mut(next.get()) {
+                Some(datagram) => {
+                    let _ = a.deliver(now(mono), b_addr(), datagram, &mut out, rng);
+                    next.set(next.get() + 1);
                 }
+                None => ran_out.set(true),
             }
         });
+        if ran_out.get() {
+            println!(
+                "{:<46} not measured: {} prepared packets were not enough",
+                "receive only (1420 B)",
+                next.get()
+            );
+        } else {
+            println!(
+                "{:<46} {:>12.1} MB/s   ({:>9.2} µs/op)",
+                "receive only (1420 B)",
+                iters as f64 * 1420.0 / secs / 1e6,
+                secs / iters as f64 * 1e6
+            );
+        }
     }
 
-    println!("\n(buffers are stack/caller-owned; the library performed zero heap allocations)");
+    // (That the library allocates nothing is not measured here: it cannot,
+    // and scripts/check_no_std.sh shows it by linking it without an
+    // allocator.)
+    println!("\n(all buffers are the caller's: on the stack, or owned by this program)");
 }

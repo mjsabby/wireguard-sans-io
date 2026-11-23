@@ -2,6 +2,8 @@
 /target/
 /fuzz/target/
 /bench/target/
+/probes/target/
+/probes/freestanding/target/
 # bench is its own workspace (excluded from the parent because of the
 # sibling boringtun path dep); its lockfile is machine-local.
 /bench/Cargo.lock
@@ -21,11 +23,11 @@ perf.data
 perf.data.old
 flamegraph.svg
 
-# Local Claude Code permission grants (machine-specific)
-.claude/settings.local.json
-
 # Local reference copy of the whitepaper (third-party document, not code)
 /wireguard.pdf
+
+# Python's bytecode cache (the scripts import each other)
+__pycache__/
 
 # Editor litter
 *.swp

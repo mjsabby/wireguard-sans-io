@@ -1,11 +1,22 @@
-//! Responder-side interop via stdin/stdout hex relay (works around the
-//! Windows firewall blocking inbound UDP from WSL).
+//! Responder-side interop via stdin/stdout hex relay: for a kernel whose
+//! datagrams cannot reach this program directly (it was written for a
+//! Windows host whose firewall blocked inbound UDP from the Linux VM
+//! beside it). The kernel is set up as for `interop_kernel_responder.rs`,
+//! with the relay's UDP port as the peer's endpoint.
+//!
+//! ```text
+//! interop_relay <our private key> <kernel's public key>      # keys in base64
+//! ```
 //!
 //! Protocol on stdio: each line is `<direction><hex>` where direction is
 //! `>` (datagram FROM kernel, feed to tunnel) and the program prints
 //! `<<hex>` for each datagram TO send to the kernel.
 //!
-//! The Python relay in WSL pumps UDP ↔ this program over stdio.
+//! The relay itself is not part of this repository; it is a few lines in
+//! any language: read datagrams from a UDP socket and write each as `>`,
+//! its bytes in hex and a newline to this program's standard input; for
+//! every line on its standard output that starts with `<`, send the
+//! decoded bytes to the address the last datagram came from.
 
 #![allow(
     clippy::unwrap_used,
@@ -22,10 +33,15 @@ use std::io::{BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wireguard_sans_io::{
-    Config, Encapsulated, EntropyError, EntropySource, Now, PollOutput, PublicKey, Received,
-    StaticSecret, Tunnel,
+    Device, Encapsulated, EntropyError, EntropySource, PeerConfig, PeerId, PollOutput, PublicKey,
+    Received, StaticSecret, Ticks, WallClock,
 };
 
+/// **Test only — DO NOT copy this into a real program.** It is not an
+/// entropy source: it stirs the clock into the standard library's hasher
+/// seeds, which is enough for a wire-format interop check on a platform
+/// without `/dev/urandom` and for nothing else. A real embedder feeds the
+/// library OS randomness (see `EMBEDDER_OBLIGATIONS.md` §1).
 struct OsRng;
 impl EntropySource for OsRng {
     fn fill(&mut self, buf: &mut [u8]) -> Result<(), EntropyError> {
@@ -71,12 +87,17 @@ fn b64_decode(s: &str) -> [u8; 32] {
     out
 }
 
-fn now() -> Now {
+/// Monotonic time since process start.
+fn now() -> Ticks {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let start = *START.get_or_init(std::time::Instant::now);
-    let mono_ns = std::time::Instant::now().duration_since(start).as_nanos() as u64;
+    Ticks::from_nanos(start.elapsed().as_nanos() as u64)
+}
+
+/// The wall clock, read once, as the anchor for handshake timestamps.
+fn wall_clock() -> WallClock {
     let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    Now::new(mono_ns, wall.as_secs(), wall.subsec_nanos())
+    WallClock::new(now(), wall.as_secs(), wall.subsec_nanos())
 }
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -127,12 +148,25 @@ fn icmp_reply(req: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn main() {
-    let server_priv =
-        StaticSecret::from_bytes(b64_decode("aFGpcWCk9YyV4nbaIeCz5IMC7iXY3UYmcBvRMFzwnVU="));
-    let client_pub =
-        PublicKey::from_bytes(b64_decode("ZZO7mwCUa2iO43fhcd/MYMDtoriAPvpE4oLROBKR/k0="));
-    let mut tunnel = Tunnel::new(Config::new(server_priv, client_pub)).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let [_, server_priv, client_pub, ..] = args.as_slice() else {
+        eprintln!("usage: interop_relay <our private key> <kernel's public key>");
+        std::process::exit(2);
+    };
+    let server_priv = StaticSecret::from_bytes(b64_decode(server_priv));
+    let client_pub = PublicKey::from_bytes(b64_decode(client_pub));
     let mut rng = OsRng;
+    let mut device = Device::new(server_priv, wall_clock(), &mut rng).unwrap();
+    let mut tunnel = device
+        .tunnel(
+            PeerId::new(0).unwrap(),
+            PeerConfig::new(client_pub),
+            &mut rng,
+        )
+        .unwrap();
+    // Everything arrives through the relay, so every datagram has the
+    // same (nominal) source address; replies go back the same way.
+    let relay: std::net::SocketAddr = "127.0.0.1:51820".parse().unwrap();
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -148,11 +182,12 @@ fn main() {
             loop {
                 let mut buf = [0u8; 2048];
                 match tunnel.poll(now(), &mut buf, &mut rng).unwrap() {
-                    PollOutput::Send(w, why) => {
+                    PollOutput::Transmit(tx, why) => {
                         events.push(format!("poll/{why:?}"));
-                        writeln!(stdout, "<{}", hex(w)).unwrap();
+                        writeln!(stdout, "<{}", hex(tx.datagram)).unwrap();
                     }
-                    _ => break,
+                    PollOutput::Idle => break,
+                    other => events.push(format!("poll/{other:?}")),
                 }
             }
             stdout.flush().unwrap();
@@ -164,31 +199,45 @@ fn main() {
             stdout.flush().unwrap();
             break;
         }
-        let datagram = unhex(&line[1..]);
-        let mut out = [0u8; 2048];
-        match tunnel.decapsulate(now(), b"relay", false, &datagram, &mut out, &mut rng) {
-            Ok(Received::Reply(w)) => {
-                events.push(format!("Reply/type{}", w[0]));
-                writeln!(stdout, "<{}", hex(w)).unwrap();
+        let mut datagram = unhex(&line[1..]);
+        let mut out = [0u8; 128];
+        let mut inner_reply = None;
+        match device
+            .receive_for(
+                &mut tunnel,
+                now(),
+                relay,
+                false,
+                &mut datagram,
+                &mut out,
+                &mut rng,
+            )
+            .unwrap()
+            .received
+        {
+            Received::HandshakeResponse(tx) | Received::CookieReply(tx) => {
+                events.push(format!("Reply/type{}", tx.datagram[0]));
+                writeln!(stdout, "<{}", hex(tx.datagram)).unwrap();
             }
-            Ok(Received::Data(d)) => {
+            Received::Data(d) => {
                 events.push(format!("Data/{}B", d.len()));
-                if let Some(reply) = icmp_reply(d) {
-                    let mut buf = [0u8; 2048];
-                    if let Encapsulated::Transport(w) = tunnel
-                        .encapsulate(now(), &reply, &mut buf, &mut rng)
-                        .unwrap()
-                    {
-                        writeln!(stdout, "<{}", hex(w)).unwrap();
-                    }
-                }
+                inner_reply = icmp_reply(d);
             }
-            Ok(Received::Keepalive) => events.push("Keepalive".into()),
-            Ok(Received::HandshakeComplete) => events.push("HandshakeComplete".into()),
-            Ok(Received::CookieStored) => events.push("CookieStored".into()),
-            Err(e) => {
-                events.push(format!("ERR/{e:?}"));
-                writeln!(stdout, "!{e:?}").unwrap();
+            Received::Keepalive => events.push("Keepalive".into()),
+            Received::HandshakeComplete => events.push("HandshakeComplete".into()),
+            Received::CookieStored => events.push("CookieStored".into()),
+            Received::Dropped(reason) => {
+                events.push(format!("DROP/{reason:?}"));
+                writeln!(stdout, "!{reason:?}").unwrap();
+            }
+            other => events.push(format!("{other:?}")),
+        }
+        if let Some(reply) = inner_reply {
+            let mut buf = [0u8; 2048];
+            if let Encapsulated::Transport(tx) =
+                tunnel.encapsulate(now(), &reply, &mut buf).unwrap()
+            {
+                writeln!(stdout, "<{}", hex(tx.datagram)).unwrap();
             }
         }
         stdout.flush().unwrap();

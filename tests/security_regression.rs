@@ -1,6 +1,5 @@
 //! Security regression tests. These previously demonstrated bugs; they
 //! now lock in the fixes.
-
 #![allow(
     clippy::unwrap_used,
     clippy::panic,
@@ -8,70 +7,10 @@
     clippy::arithmetic_side_effects
 )]
 
+mod common;
+use common::{Opts, Polled, Rx, Sim, Tx, Who, a_addr, b_addr, new_pair, new_pair_opts, x_addr};
 use wireguard_sans_io::crypto::blake2s;
-use wireguard_sans_io::testing::DeterministicRng;
-use wireguard_sans_io::{
-    Config, Encapsulated, EntropyError, EntropySource, Error, Now, PollOutput, Received,
-    SendReason, StaticSecret, Tunnel,
-};
-
-/// An entropy source that succeeds N times, then fails forever.
-struct CountdownRng {
-    inner: DeterministicRng,
-    remaining: usize,
-}
-impl EntropySource for CountdownRng {
-    fn fill(&mut self, buf: &mut [u8]) -> Result<(), EntropyError> {
-        if self.remaining == 0 {
-            return Err(EntropyError);
-        }
-        self.remaining -= 1;
-        self.inner.fill(buf)
-    }
-}
-
-// ============================================================================
-// Jitter entropy failure must not strand a phantom in-flight handshake. The
-// fix degrades jitter to 0 and commits state atomically.
-// ============================================================================
-#[test]
-fn entropy_failure_during_jitter_does_not_stall() {
-    let mut rng = DeterministicRng::new(1);
-    let a_key = StaticSecret::generate(&mut rng).unwrap();
-    let b_key = StaticSecret::generate(&mut rng).unwrap();
-    let mut cfg = Config::new(a_key, b_key.public_key());
-    cfg.persistent_keepalive = Some(core::num::NonZeroU16::new(25).unwrap());
-    let mut a = Tunnel::new(cfg).unwrap();
-
-    // index ok, eph ok, jitter draw FAILS:
-    let mut bad_rng = CountdownRng {
-        inner: DeterministicRng::new(2),
-        remaining: 2,
-    };
-    let now = Now::new(0, 1_700_000_000, 0);
-    let mut buf = [0u8; 2048];
-
-    // With the fix, jitter degrades to 0 and the initiation is emitted.
-    match a.poll(now, &mut buf, &mut bad_rng).unwrap() {
-        PollOutput::Send(wire, SendReason::HandshakeInitiation) => {
-            assert_eq!(wire.len(), 148);
-        }
-        other => panic!("expected initiation despite jitter-entropy failure, got {other:?}"),
-    }
-    // Retransmission is armed (jitter=0 ⇒ retransmit_at = now + 5s).
-    assert_eq!(
-        a.next_wake().map(|t| t.nanos()),
-        Some(5_000_000_000),
-        "retransmit_at must be armed even when jitter entropy failed"
-    );
-    // And a working rng can keep driving the state machine.
-    let mut good = DeterministicRng::new(3);
-    let later = Now::new(6_000_000_000, 1_700_000_006, 0);
-    match a.poll(later, &mut buf, &mut good).unwrap() {
-        PollOutput::Send(_, SendReason::HandshakeRetransmit) => {}
-        other => panic!("expected retransmit, got {other:?}"),
-    }
-}
+use wireguard_sans_io::{DropReason, SendReason};
 
 // ============================================================================
 // A mac2 forged against the all-zero `previous` cookie secret must be
@@ -80,141 +19,268 @@ fn entropy_failure_during_jitter_does_not_stall() {
 // ============================================================================
 #[test]
 fn cookie_jar_rejects_all_zero_previous_forgery() {
-    let mut rng = DeterministicRng::new(7);
-    let _a_key = StaticSecret::generate(&mut rng).unwrap();
-    let b_key = StaticSecret::generate(&mut rng).unwrap();
-    let b_pub = b_key.public_key();
+    let mut p = new_pair(7);
+    let now = p.clock.now();
     // A third party who knows the responder's pubkey but holds a different
     // static key.
-    let m_key = StaticSecret::generate(&mut rng).unwrap();
-    let m_pub = m_key.public_key();
-    let mut responder = Tunnel::new(Config::new(b_key, m_pub)).unwrap();
-    let mut mallory = Tunnel::new(Config::new(m_key, b_pub)).unwrap();
-
-    let now = Now::new(0, 1_700_000_000, 0);
-    let mut buf_m = [0u8; 2048];
-    let mut buf_r = [0u8; 2048];
-    let remote_m = b"198.51.100.7:1";
+    let (m_key, _) = common::keypair(&mut p.rng);
+    let mut mallory = common::side(
+        m_key,
+        p.b.device.public_key(),
+        x_addr(),
+        Some(b_addr()),
+        None,
+        None,
+        &mut p.rng,
+    );
 
     // Step 1: prime the responder's cookie jar.
-    let init1 = match mallory
-        .encapsulate(now, b"x", &mut buf_m, &mut rng)
-        .unwrap()
-    {
-        Encapsulated::HandshakeInitiation(w) => w.to_vec(),
-        _ => panic!(),
-    };
-    let r = responder
-        .decapsulate(now, remote_m, true, &init1, &mut buf_r, &mut rng)
-        .unwrap();
-    assert!(matches!(r, Received::Reply(_)));
-    assert_eq!(responder.stats().cookies_sent, 1);
+    let init1 = mallory.initiate(now, &mut p.rng);
+    assert!(matches!(
+        p.b.recv_from(now, x_addr(), true, &init1, &mut p.rng).rx,
+        Rx::CookieReply(_)
+    ));
+    assert_eq!(p.b.device.stats().cookies_sent, 1);
 
-    // Step 2: forge mac2 against the all-zero key, ignoring the cookie reply.
-    let now2 = Now::new(6_000_000_000, 1_700_000_006, 0);
-    let init2 = mallory
-        .initiate_handshake(now2, &mut buf_m, &mut rng)
-        .unwrap()
-        .to_vec();
+    // Step 2: forge mac2 against the all-zero key, ignoring the cookie
+    // reply. The cookie is Mac(secret, IP ‖ port).
+    let now2 = p.clock.advance(6 * common::S);
+    let init2 = mallory.initiate(now2, &mut p.rng);
     let mut forged = init2.clone();
-    let beta = &forged[..132];
-    let forged_cookie = blake2s::mac(&[0u8; 32], &[remote_m.as_slice()]);
-    let forged_mac2 = blake2s::mac(&forged_cookie, &[beta]);
+    let remote: [u8; 6] = [203, 0, 113, 66, 0x11, 0x5c]; // x_addr() = 203.0.113.66:4444
+    assert_eq!(x_addr().port(), 0x115c);
+    let forged_cookie = blake2s::mac(&[0u8; 32], &[remote.as_slice()]);
+    let forged_mac2 = blake2s::mac(&forged_cookie, &[&forged[..132]]);
     forged[132..148].copy_from_slice(&forged_mac2);
 
     // Step 3: under load, the forgery must be REJECTED → cookie reply,
     // not full handshake processing.
-    let r = responder
-        .decapsulate(now2, remote_m, true, &forged, &mut buf_r, &mut rng)
-        .unwrap();
     assert!(
-        matches!(r, Received::Reply(_)),
+        matches!(
+            p.b.recv_from(now2, x_addr(), true, &forged, &mut p.rng).rx,
+            Rx::CookieReply(_)
+        ),
         "forged mac2 must not bypass under-load protection"
     );
     assert_eq!(
-        responder.stats().cookies_sent,
+        p.b.device.stats().cookies_sent,
         2,
         "responder must answer the forgery with a (cheap) cookie reply"
     );
-}
-
-// ============================================================================
-// Persistent keepalive must revive the tunnel after `gave_up`, backing off by
-// one keepalive interval rather than going silent forever.
-// ============================================================================
-#[test]
-fn persistent_keepalive_revives_after_gave_up() {
-    const S: u64 = 1_000_000_000;
-    let mut rng = DeterministicRng::new(9);
-    let a_key = StaticSecret::generate(&mut rng).unwrap();
-    let b_key = StaticSecret::generate(&mut rng).unwrap();
-    let mut cfg = Config::new(a_key, b_key.public_key());
-    cfg.persistent_keepalive = Some(core::num::NonZeroU16::new(25).unwrap());
-    let mut a = Tunnel::new(cfg).unwrap();
-    let mut buf = [0u8; 2048];
-
-    // Drive a handshake attempt to exhaustion (peer never answers).
-    let mut t = 0u64;
-    let _ = a
-        .initiate_handshake(Now::new(t, t / S, 0), &mut buf, &mut rng)
-        .unwrap();
-    let mut expired = false;
-    while t <= 95 * S {
-        t += S;
-        loop {
-            match a.poll(Now::new(t, t / S, 0), &mut buf, &mut rng).unwrap() {
-                PollOutput::Idle => break,
-                PollOutput::HandshakeExpired => {
-                    expired = true;
-                    break;
-                }
-                PollOutput::Send(_, _) => {} // retransmits; drop them
-                other => panic!("unexpected {other:?}"),
-            }
-        }
-        if expired {
-            break;
-        }
-    }
-    assert!(expired, "attempt must expire after REKEY_ATTEMPT_TIME");
-
-    // After gave_up, next_wake must NOT be None: it must point at the
-    // persistent-keepalive revival deadline.
-    let wake = a.next_wake();
-    assert!(
-        wake.is_some(),
-        "persistent keepalive must keep a deadline armed after gave_up"
+    assert_eq!(
+        p.b.device.stats().initiations,
+        0,
+        "no Diffie-Hellman was done"
     );
-    // And polling at/after that deadline must produce a fresh initiation.
-    let revive_t = wake.unwrap().nanos().max(t);
-    match a
-        .poll(Now::new(revive_t, revive_t / S, 0), &mut buf, &mut rng)
-        .unwrap()
-    {
-        PollOutput::Send(_, SendReason::HandshakeInitiation) => {}
-        other => panic!("expected revival initiation at {revive_t}, got {other:?}"),
-    }
 }
 
 // ============================================================================
-// Handshake-response mac1 is verified before the index match, so an off-path
-// attacker can't timing-probe the in-flight index.
+// Handshake-response mac1 is verified before the receiver index is looked
+// at, so an off-path attacker can't timing-probe the in-flight index.
 // ============================================================================
 #[test]
 fn response_mac1_checked_before_index() {
-    let mut rng = DeterministicRng::new(11);
-    let a_key = StaticSecret::generate(&mut rng).unwrap();
-    let b_key = StaticSecret::generate(&mut rng).unwrap();
-    let mut a = Tunnel::new(Config::new(a_key, b_key.public_key())).unwrap();
-    let now = Now::new(0, 0, 0);
-    let mut buf = [0u8; 2048];
+    let mut p = new_pair(11);
+    let now = p.clock.now();
     // Put a handshake in flight so an index *could* match.
-    let _ = a.initiate_handshake(now, &mut buf, &mut rng).unwrap();
-    // A 92-byte response with garbage everywhere (mac1 invalid). With the
-    // fix, this returns InvalidMac1 regardless of receiver_index.
-    let mut resp = [0u8; 92];
-    resp[0] = 2; // type
-    let mut out = [0u8; 256];
-    let r = a.decapsulate(now, &[], false, &resp, &mut out, &mut rng);
-    assert_eq!(r.err(), Some(Error::InvalidMac1));
+    let init = p.a_initiates();
+    // A 92-byte response with garbage everywhere (mac1 invalid): rejected
+    // for its mac1 whatever the receiver index says — including the index
+    // that IS in flight.
+    for index in [[0u8; 4], [0xff; 4], init[4..8].try_into().unwrap()] {
+        let mut resp = [0u8; 92];
+        resp[0] = 2; // type
+        resp[8..12].copy_from_slice(&index);
+        assert_eq!(
+            p.a.recv_from(now, b_addr(), false, &resp, &mut p.rng).rx,
+            Rx::Dropped(DropReason::InvalidMac1)
+        );
+    }
+    assert_eq!(p.a.device.stats().mac1_failures, 3);
+    assert_eq!(
+        p.a.tunnel.stats().auth_failures,
+        0,
+        "the tunnel never saw them"
+    );
+}
+
+// ============================================================================
+// The peer's endpoint must only move on authenticated messages. A cookie
+// reply is produced for a handshake message that merely carries a valid
+// mac1 — which anyone who knows our PUBLIC key can make — so it must never
+// redirect the tunnel. (An earlier driver treated every reply as proof of
+// the peer's address: thirty such initiations from an unrelated socket
+// diverted the tunnel's traffic to that socket.)
+// ============================================================================
+#[test]
+fn outsider_with_only_our_public_key_cannot_redirect_traffic() {
+    let mut p = new_pair(12);
+    p.establish();
+    p.assert_roundtrip_a_to_b(b"baseline");
+    let now = p.clock.now();
+
+    // Thirty mac1-valid initiations from throwaway identities, under load.
+    for _ in 0..30 {
+        let (key, _) = common::keypair(&mut p.rng);
+        let mut throwaway = common::side(
+            key,
+            p.b.device.public_key(),
+            x_addr(),
+            Some(b_addr()),
+            None,
+            None,
+            &mut p.rng,
+        );
+        let init = throwaway.initiate(now, &mut p.rng);
+        let info = p.b.recv_from(now, x_addr(), true, &init, &mut p.rng);
+        assert!(matches!(info.rx, Rx::CookieReply(_)));
+        assert!(!info.endpoint_changed);
+    }
+    assert_eq!(p.b.tunnel.endpoint(), Some(a_addr()));
+    // B's next packet still goes to A, and A receives it.
+    let mut buf = [0u8; 128];
+    let wire = match p
+        .b
+        .tunnel
+        .encapsulate(now, b"for a only", &mut buf)
+        .unwrap()
+    {
+        wireguard_sans_io::Encapsulated::Transport(tx) => {
+            assert_eq!(tx.dst, a_addr());
+            tx.datagram.to_vec()
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(&p.open_at_a(&wire)[..10], b"for a only");
+}
+
+// ============================================================================
+// A side that was holding a packet (no session) and then ends up as the
+// RESPONDER of the handshake that completes must be told that it can send
+// now. (An earlier driver only learned of sessions it had initiated, and
+// left such a packet queued while later packets overtook it.)
+// ============================================================================
+#[test]
+fn responder_side_is_told_when_its_session_is_established() {
+    let mut p = new_pair(13);
+    let now = p.clock.now();
+    // B wants to send, has no session: it asks for a handshake, and its
+    // initiation is lost.
+    assert_eq!(p.b.send(now, b"queued by the embedder"), Tx::NoSession);
+    assert!(matches!(
+        p.b.poll(now, &mut p.rng),
+        Polled::Transmit(_, SendReason::HandshakeInitiation, _)
+    ));
+    // Meanwhile A initiates; B answers as responder.
+    let init = p.a_initiates();
+    let info = p.deliver_to_b(&init);
+    let resp = match info.rx {
+        Rx::Response(w) => w,
+        other => panic!("{other:?}"),
+    };
+    assert!(!info.session_established);
+    assert_eq!(p.deliver_to_a(&resp).rx, Rx::HandshakeComplete);
+    let confirm = match p.a.poll(now, &mut p.rng) {
+        Polled::Transmit(w, SendReason::Keepalive, _) => w,
+        other => panic!("{other:?}"),
+    };
+    // A's confirming keepalive — not data, and B is not the initiator —
+    // is where B learns the session is usable.
+    let info = p.deliver_to_b(&confirm);
+    assert_eq!(info.rx, Rx::Keepalive);
+    assert!(info.session_established, "the responder must be told");
+    // The held packet can go out now, ahead of anything newer.
+    let wire = p.seal_from_b(b"queued by the embedder");
+    assert_eq!(&p.open_at_a(&wire)[..22], b"queued by the embedder");
+}
+
+// ============================================================================
+// A peer that only ever sends keepalives (persistent keepalive behind a
+// NAT that re-maps it) still roams: a keepalive is an authenticated
+// message like any other.
+// ============================================================================
+#[test]
+fn keepalive_only_peer_roams() {
+    let mut s = Sim::with_opts(
+        14,
+        Opts {
+            keepalive_a: Some(25),
+            b_without_endpoint: true,
+            ..Opts::default()
+        },
+    );
+    s.run_until(common::S);
+    assert_eq!(s.p.b.tunnel.endpoint(), Some(a_addr()));
+    // The NAT in front of A picks a new mapping; A sends nothing but its
+    // persistent keepalives.
+    let remapped: std::net::SocketAddr = "192.0.2.1:40000".parse().unwrap();
+    s.p.a.addr = remapped;
+    s.run_until(30 * common::S);
+    assert_eq!(
+        s.count(Who::A, SendReason::PersistentKeepalive, 0, u64::MAX),
+        1
+    );
+    assert_eq!(
+        s.p.b.tunnel.endpoint(),
+        Some(remapped),
+        "the server must follow the keepalive's source address"
+    );
+    let _ = new_pair_opts(0, Opts::default());
+}
+
+// ============================================================================
+// `{:?}` of what a receive call returns ends up in logs. It must say how
+// much was received, not what: a decrypted packet printed its bytes
+// through the derived `Debug` of `Received::Data` (and so of `Handled`).
+// ============================================================================
+#[test]
+fn debug_output_gives_the_size_of_a_payload_never_its_bytes() {
+    use wireguard_sans_io::{Encapsulated, Incoming};
+    let mut p = new_pair(9);
+    p.establish();
+    let now = p.clock.now();
+    // 48 bytes whose values are unmistakable in decimal and in hex.
+    let payload: Vec<u8> = (0..48u8).map(|i| 200 + i).collect();
+    let leaks = |shown: &str| {
+        payload.windows(2).any(|w| {
+            shown.contains(&format!("{}, {}", w[0], w[1]))
+                || shown.contains(&format!("{:02x}{:02x}", w[0], w[1]))
+                || shown.contains(&format!("{:02X}{:02X}", w[0], w[1]))
+        })
+    };
+    assert!(leaks(&format!("{payload:?}")), "the check can see a leak");
+
+    let wire = match p.a.tunnel.encapsulate(now, &payload, &mut [0u8; 128]) {
+        Ok(Encapsulated::Transport(tx)) => {
+            // What goes out is ciphertext; its Debug is destination and size.
+            let shown = format!("{tx:?}");
+            assert_eq!(
+                shown,
+                format!("Transmit {{ dst: {}, datagram: 80 bytes }}", b_addr())
+            );
+            tx.datagram.to_vec()
+        }
+        other => panic!("{other:?}"),
+    };
+
+    // Routed, not yet decrypted.
+    let mut copy = wire.clone();
+    match p.b.device.receive(now, a_addr(), false, &mut copy) {
+        Incoming::ForPeer(_, packet) => {
+            let shown = format!("{packet:?} {packet:#?}");
+            assert!(shown.contains("body: 64 bytes"), "{shown}");
+            let handled = p.b.tunnel.handle(now, a_addr(), packet).unwrap();
+            // Decrypted: the result, and everything that wraps it.
+            for shown in [
+                format!("{handled:?}"),
+                format!("{handled:#?}"),
+                format!("{:?}", handled.received),
+                format!("{:#?}", handled.received),
+            ] {
+                assert!(shown.contains("Data(48 bytes)"), "{shown}");
+                assert!(!leaks(&shown), "{shown}");
+            }
+        }
+        other => panic!("{other:?}"),
+    }
 }

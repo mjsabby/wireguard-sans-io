@@ -2,14 +2,13 @@
 name = "wireguard-chacha-simd"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mjsabby/wireguard-sans-io"
-description = "Pluggable ChaCha20 keystream backends (scalar / AVX2 4-way / NEON 4-way) for wireguard-sans-io. This crate alone in the workspace permits `unsafe` — every intrinsic call is bounded by the trait's fixed-size array signature and validated against the RFC vectors and the safe scalar reference."
+description = "Pluggable ChaCha20 keystream backends (scalar / AVX2 8-way / AVX-512 16- and 32-way, found at run time / NEON 4-way) for wireguard-sans-io. This crate alone in the workspace permits `unsafe` — every intrinsic call is bounded by fixed-size array signatures and validated against the RFC vectors and the safe scalar reference."
 
 [lib]
-# No doctests in this crate; disabling avoids a separate doctest
-# compilation that (on some cargo versions) doesn't inherit
-# `[target.*] rustflags` and would trip the AVX2 `compile_error!`.
+# No doctests in this crate.
 doctest = false
 
 [dependencies]

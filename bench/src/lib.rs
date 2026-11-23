@@ -7,6 +7,8 @@
 
 #![allow(clippy::missing_panics_doc)]
 
+use std::net::SocketAddr;
+
 use rand_core::{OsRng, RngCore};
 
 pub use boringtun;
@@ -60,6 +62,10 @@ impl Fixture {
 pub struct EmbedPair {
     pub a: wireguard_embed::Tunn,
     pub b: wireguard_embed::Tunn,
+    /// The address A's datagrams "come from" (what B is told on receive).
+    pub a_addr: SocketAddr,
+    /// The address B's datagrams "come from"; A's configured endpoint.
+    pub b_addr: SocketAddr,
     pub buf_a: Vec<u8>,
     pub buf_b: Vec<u8>,
 }
@@ -68,18 +74,23 @@ impl EmbedPair {
     pub fn new(fx: &Fixture) -> Self {
         use wireguard_embed::{RateLimiter, Tunn, TunnResult};
         use wireguard_sans_io::{PublicKey, StaticSecret};
+        let a_addr: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        let b_addr: SocketAddr = "192.0.2.2:51820".parse().unwrap();
         let rl = std::sync::Arc::new(RateLimiter::new(1_000_000)); // benches: never under_load
+        // A is configured with B's endpoint; B learns A's from the handshake.
         let mut a = Tunn::new(
             StaticSecret::from_bytes(fx.a_priv),
             PublicKey::from_bytes(fx.b_pub),
             None,
             None,
+            Some(b_addr),
             Some(rl.clone()),
         )
         .unwrap();
         let mut b = Tunn::new(
             StaticSecret::from_bytes(fx.b_priv),
             PublicKey::from_bytes(fx.a_pub),
+            None,
             None,
             None,
             Some(rl),
@@ -89,36 +100,65 @@ impl EmbedPair {
         let mut buf_b = vec![0u8; 2048];
 
         let init = match a.format_handshake_initiation(&mut buf_a) {
-            TunnResult::WriteToNetwork(w) => w.to_vec(),
+            TunnResult::WriteToNetwork(w, _) => w.to_vec(),
             r => panic!("init: {r:?}"),
         };
-        let resp = match b.decapsulate(None, &init, &mut buf_b) {
-            TunnResult::WriteToNetwork(w) => w.to_vec(),
+        let resp = match b.decapsulate(a_addr, &init, &mut buf_b) {
+            TunnResult::WriteToNetwork(w, _) => w.to_vec(),
             r => panic!("resp: {r:?}"),
         };
-        let ka = match a.decapsulate(None, &resp, &mut buf_a) {
-            TunnResult::WriteToNetwork(w) => w.to_vec(),
+        let ka = match a.decapsulate(b_addr, &resp, &mut buf_a) {
+            TunnResult::WriteToNetwork(w, _) => w.to_vec(),
             r => panic!("ka: {r:?}"),
         };
-        match b.decapsulate(None, &ka, &mut buf_b) {
+        match b.decapsulate(a_addr, &ka, &mut buf_b) {
             TunnResult::Done => {}
             r => panic!("ka recv: {r:?}"),
         }
         assert!(a.is_established() && b.is_established());
-        Self { a, b, buf_a, buf_b }
+        Self {
+            a,
+            b,
+            a_addr,
+            b_addr,
+            buf_a,
+            buf_b,
+        }
     }
 
-    /// One-way: encrypt at A, decrypt at B. Returns plaintext length.
+    /// One-way: encrypt at A, decrypt at B (the copying `decapsulate`,
+    /// the like-for-like counterpart of BoringTun's). Returns plaintext
+    /// length.
     pub fn roundtrip(&mut self, packet: &[u8]) -> usize {
         use wireguard_embed::TunnResult;
+        // Copied out, exactly as `BoringPair::roundtrip` does, so both
+        // sides of the comparison pay for the same allocation.
         let wire = match self.a.encapsulate(packet, &mut self.buf_a) {
-            TunnResult::WriteToNetwork(w) => w,
+            TunnResult::WriteToNetwork(w, _) => w.to_vec(),
             r => panic!("encap: {r:?}"),
         };
-        // SAFETY-of-benchmark: wire borrows buf_a; copy to avoid aliasing
-        // with buf_b. (Buffer-pool work will let us measure zero-copy.)
-        let wire = wire.to_vec();
-        match self.b.decapsulate(None, &wire, &mut self.buf_b) {
+        match self.b.decapsulate(self.a_addr, &wire, &mut self.buf_b) {
+            TunnResult::WriteToTunnel(d) => d.len(),
+            r => panic!("decap: {r:?}"),
+        }
+    }
+
+    /// One-way: encrypt at A, decrypt at B **in place**, in the buffer
+    /// the datagram was written to — the receive path the async driver
+    /// uses. Unlike [`EmbedPair::roundtrip`] nothing is copied or
+    /// allocated, so this is not a like-for-like line against BoringTun
+    /// (whose API has no in-place receive); it shows what the copy costs.
+    /// Returns plaintext length.
+    pub fn roundtrip_in_place(&mut self, packet: &[u8]) -> usize {
+        use wireguard_embed::TunnResult;
+        let n = match self.a.encapsulate(packet, &mut self.buf_a) {
+            TunnResult::WriteToNetwork(w, _) => w.len(),
+            r => panic!("encap: {r:?}"),
+        };
+        match self
+            .b
+            .decapsulate_in_place(self.a_addr, &mut self.buf_a[..n], &mut self.buf_b)
+        {
             TunnResult::WriteToTunnel(d) => d.len(),
             r => panic!("decap: {r:?}"),
         }

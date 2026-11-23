@@ -1,0 +1,44 @@
+# A freestanding image that goes through every public entry point of the
+# core with the default crypto provider. It is never run; what matters is
+# whether — and into what — it links:
+#
+#   * it is built for a target that has no `std` and is given no global
+#     allocator, so it links only if the core uses neither;
+#   * the linked image is then searched for panic machinery: after
+#     optimisation there must be none left.
+#
+# See scripts/check_no_std.sh and scripts/check_no_panic.sh, which also
+# check that the three `canary-*` features — each plants exactly the thing
+# that must not be there — are caught.
+[package]
+name = "wireguard-freestanding"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone on purpose (not a member of the main workspace).
+[workspace]
+
+[dependencies]
+wireguard-sans-io = { path = "../..", default-features = false }
+
+[features]
+# The library's own default, passed through — so that
+# `--no-default-features` here builds the library without it.
+default = ["x25519-table"]
+x25519-table = ["wireguard-sans-io/x25519-table"]
+canary-panic = []
+canary-alloc = []
+canary-std = []
+
+[profile.dev]
+panic = "abort"
+
+# The image has to be optimised as a whole for the scan to mean anything:
+# a panic branch counts as absent only if the optimiser removed it, and it
+# can only do that where it sees caller and callee together.
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

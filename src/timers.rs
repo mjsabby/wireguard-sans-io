@@ -1,253 +1,301 @@
-//! Timer bookkeeping for whitepaper §6: pure state plus deadline
-//! arithmetic, no clocks.
+//! The timer table for whitepaper §6: one armed deadline per timer, and
+//! nothing else.
 //!
-//! The [`Timers`] struct records *when things last happened*; the tunnel
-//! asks it *what is due* at a caller-supplied instant and reports the
-//! earliest future deadline through [`Timers::next_wake`].
+//! WireGuard's timer behaviour is specified as five timers that protocol
+//! events arm and cancel (§6.1–§6.5; the Linux implementation's
+//! `timers.c` is the same five). This module keeps exactly that — a table
+//! of `Option<Ticks>` deadlines — plus three deadlines of its own for work
+//! that an implementation with a packet queue and a worker thread would
+//! hand to those (see [`Timer`]). Where the behaviour deliberately differs
+//! from Linux is listed in the README ("Protocol notes") and, with the
+//! kernel functions named, in `tests/common/timer_model.rs`.
+//!
+//! * An event *arms* a timer (records when it will fire) or *clears* it.
+//! * [`crate::Tunnel::next_wake`] is the minimum of the table.
+//! * [`crate::Tunnel::poll`] takes the timers whose deadline has passed,
+//!   one at a time, and runs their handlers.
+//!
+//! Because both functions read the same table, they cannot disagree: after
+//! `poll` reports `Idle`, every armed deadline is strictly in the future.
+//! And because a timer is a deadline rather than a condition re-evaluated
+//! from "time since the last packet", it fires once per arming, measured
+//! from the event that armed it — the *first* unanswered packet, as the
+//! whitepaper specifies, not the most recent one.
 
-use crate::consts::{
-    DEAD_PEER_TIMEOUT, KEEPALIVE_TIMEOUT, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT,
-    REKEY_TIMEOUT_JITTER_MAX,
-};
 use crate::time::Ticks;
 
-/// Traffic timestamps and armed deadlines.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct Timers {
-    /// Last transport *data* (non-keepalive) we sent.
-    pub last_data_tx: Option<Ticks>,
-    /// Last transport data (non-keepalive) we received.
-    pub last_data_rx: Option<Ticks>,
-    /// Last transport message of any kind we sent (incl. keepalives).
-    pub last_any_tx: Option<Ticks>,
-    /// Last transport message of any kind we received.
-    pub last_any_rx: Option<Ticks>,
-    /// When the in-flight handshake attempt started (Rekey-Attempt-Time
-    /// window).
-    pub attempt_started: Option<Ticks>,
-    /// When the next retransmission of the in-flight initiation is due
-    /// (Rekey-Timeout + jitter after the last send).
-    pub retransmit_at: Option<Ticks>,
-    /// When we last sent *any* initiation (global once-per-Rekey-Timeout
-    /// pacing; whitepaper §6.1).
-    pub last_initiation_tx: Option<Ticks>,
-    /// Traffic-limit rekey wanted (set on the send/receive paths, §6.2).
-    pub rekey_due: bool,
-    /// An initiator handshake just completed and nothing has been sent on
-    /// the new session yet: emit a keepalive so the responder confirms.
-    pub confirm_keepalive_due: bool,
-    /// The last handshake attempt ran out of Rekey-Attempt-Time. Timer
-    /// triggers stay quiet until the next explicit data event (§6.4: the
-    /// attempt counter "is reset when a peer explicitly attempts to send a
-    /// new transport data message").
-    pub gave_up: bool,
+/// One of a [`crate::Tunnel`]'s deadlines.
+///
+/// The first five are the timers of whitepaper §6 (and of the Linux
+/// implementation). The last three are deadlines this implementation
+/// needs because it has no packet queue and no background worker:
+/// `SendInitiation` and `FlushKeepalive` stand for "as soon as possible"
+/// (a handshake that is wanted, once the pacing of §6.1 allows it; a
+/// keepalive that is owed, once a session is usable), and
+/// `ExpireNextSession` for a check Linux makes lazily, when a keypair is
+/// used. They add no protocol rule of their own — but one of them makes a
+/// visible difference to Linux: a handshake request that comes too soon
+/// after the last initiation is *postponed* to the pacing deadline here,
+/// where Linux drops it and waits for a later event to ask again.
+///
+/// Read a tunnel's deadlines with [`crate::Tunnel::timer`] — for
+/// diagnostics ("what is this tunnel waiting for?") and for testing the
+/// timer behaviour against a reference model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Timer {
+    /// §6.4 — an initiation is in flight; if no response arrives by the
+    /// deadline (`Rekey-Timeout` plus up to 333 ms of jitter) it is
+    /// retransmitted with a fresh ephemeral, until `Rekey-Attempt-Time`
+    /// has passed.
+    ///
+    /// *Armed* when an initiation is sent. *Cleared* when the handshake
+    /// completes, or the attempt is given up.
+    RetransmitHandshake,
+    /// §6.5 — we received transport data and have sent nothing since; at
+    /// the deadline (`Keepalive-Timeout` after the first such packet) a
+    /// keepalive goes out so the peer knows we are alive.
+    ///
+    /// *Armed* when data arrives and the timer is not already running.
+    /// *Cleared* when we send any authenticated message.
+    SendKeepalive,
+    /// §6.5 — we sent transport data and have heard nothing since; at the
+    /// deadline (`Keepalive-Timeout + Rekey-Timeout` after the first such
+    /// packet) the session is presumed dead and a new handshake starts.
+    ///
+    /// *Armed* when data is sent and the timer is not already running.
+    /// *Cleared* when any authenticated message arrives, including a
+    /// handshake message.
+    NewHandshake,
+    /// §6.3 — no new session for `3 × Reject-After-Time`: the keys of
+    /// every session that was in use are wiped. A handshake under way at
+    /// that moment is left to finish (see
+    /// [`crate::PollOutput::SessionsExpired`]).
+    ///
+    /// *Armed* whenever a session is established, for `3 ×
+    /// Reject-After-Time` after that session's keys were derived; it only
+    /// ever moves later.
+    ZeroKeyMaterial,
+    /// The configured persistent keepalive interval has passed with no
+    /// authenticated message in either direction.
+    ///
+    /// *Re-armed* whenever an authenticated message is sent or received —
+    /// and, if it has fired since, when a handshake attempt is given up,
+    /// so that a tunnel with a persistent keepalive always has either
+    /// this timer or a handshake of its own pending.
+    PersistentKeepalive,
+    /// A handshake is wanted and will be initiated at the deadline — the
+    /// instant the once-per-`Rekey-Timeout` pacing (§6.1) allows it.
+    SendInitiation,
+    /// A keepalive is waiting for a usable session (the confirmation an
+    /// initiator sends right after a handshake, or a keepalive that came
+    /// due while a handshake was still running).
+    FlushKeepalive,
+    /// A session we answered and have not switched to is wiped at its
+    /// `Reject-After-Time` — whether the peer never used it, or used it
+    /// while we kept sending on a session of our own (crossed handshakes).
+    ///
+    /// *Armed* when an initiation is answered. *Cleared* when that session
+    /// becomes the current one.
+    ExpireNextSession,
 }
 
-impl Timers {
-    /// Record a data-bearing transport send.
-    pub fn note_data_tx(&mut self, now: Ticks) {
-        self.last_data_tx = Some(now);
-        self.last_any_tx = Some(now);
-        self.confirm_keepalive_due = false;
-        self.gave_up = false;
-    }
+/// Number of timers.
+const COUNT: usize = 8;
 
-    /// Record a keepalive send.
-    pub fn note_keepalive_tx(&mut self, now: Ticks) {
-        self.last_any_tx = Some(now);
-        self.confirm_keepalive_due = false;
-    }
+impl Timer {
+    /// Every timer, in the order [`crate::Tunnel::poll`] services timers
+    /// that are due at the same call: wipes first, then the handshake
+    /// machinery, then keepalives.
+    pub const ALL: [Self; COUNT] = [
+        Self::ZeroKeyMaterial,
+        Self::ExpireNextSession,
+        Self::RetransmitHandshake,
+        Self::NewHandshake,
+        Self::SendInitiation,
+        Self::FlushKeepalive,
+        Self::SendKeepalive,
+        Self::PersistentKeepalive,
+    ];
 
-    /// Record an authenticated inbound transport message.
-    pub fn note_rx(&mut self, now: Ticks, is_keepalive: bool) {
-        self.last_any_rx = Some(now);
-        if !is_keepalive {
-            self.last_data_rx = Some(now);
+    const fn slot(self) -> usize {
+        match self {
+            Self::RetransmitHandshake => 0,
+            Self::SendKeepalive => 1,
+            Self::NewHandshake => 2,
+            Self::ZeroKeyMaterial => 3,
+            Self::PersistentKeepalive => 4,
+            Self::SendInitiation => 5,
+            Self::FlushKeepalive => 6,
+            Self::ExpireNextSession => 7,
         }
-        self.gave_up = false;
     }
+}
 
-    /// Record that an initiation went out: starts/continues the attempt
-    /// window, arms the retransmission deadline with jitter, and applies
-    /// pacing.
-    pub fn note_initiation_tx(&mut self, now: Ticks, jitter: u64) {
-        if self.attempt_started.is_none() {
-            self.attempt_started = Some(now);
+/// The armed deadlines of one tunnel.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TimerTable {
+    deadlines: [Option<Ticks>; COUNT],
+}
+
+impl TimerTable {
+    /// No timer armed.
+    pub(crate) const fn new() -> Self {
+        Self {
+            deadlines: [None; COUNT],
         }
-        self.last_initiation_tx = Some(now);
-        self.retransmit_at = Some(
-            now.add_nanos(REKEY_TIMEOUT)
-                .add_nanos(jitter.min(REKEY_TIMEOUT_JITTER_MAX)),
-        );
-        self.rekey_due = false;
     }
 
-    /// Handshake completed: clear the attempt machinery.
-    pub fn note_handshake_complete(&mut self) {
-        self.attempt_started = None;
-        self.retransmit_at = None;
-        self.rekey_due = false;
-        self.gave_up = false;
+    /// Arm `timer` to fire at `at`, replacing any earlier deadline.
+    pub(crate) fn arm(&mut self, timer: Timer, at: Ticks) {
+        if let Some(slot) = self.deadlines.get_mut(timer.slot()) {
+            *slot = Some(at);
+        }
     }
 
-    /// Abandon the current attempt (Rekey-Attempt-Time exhausted).
-    pub fn note_gave_up(&mut self) {
-        self.attempt_started = None;
-        self.retransmit_at = None;
-        self.rekey_due = false;
-        self.gave_up = true;
+    /// Arm `timer` to fire at `at` unless it is already running.
+    pub(crate) fn arm_if_idle(&mut self, timer: Timer, at: Ticks) {
+        if !self.is_armed(timer) {
+            self.arm(timer, at);
+        }
     }
 
-    /// Is the attempt window exhausted at `now`? (§6.4)
-    pub fn attempt_exhausted(&self, now: Ticks) -> bool {
-        self.attempt_started
-            .is_some_and(|t0| now.since(t0) >= REKEY_ATTEMPT_TIME)
+    /// Cancel `timer`.
+    pub(crate) fn clear(&mut self, timer: Timer) {
+        if let Some(slot) = self.deadlines.get_mut(timer.slot()) {
+            *slot = None;
+        }
     }
 
-    /// May another initiation be sent at `now`? Never more than one per
-    /// Rekey-Timeout, under any circumstances (§6.1).
-    pub fn initiation_allowed(&self, now: Ticks) -> bool {
-        self.last_initiation_tx
-            .is_none_or(|t| now.since(t) >= REKEY_TIMEOUT)
+    /// Cancel every timer.
+    pub(crate) fn clear_all(&mut self) {
+        self.deadlines = [None; COUNT];
     }
 
-    /// Passive keepalive due (§6.5): we received data and sent nothing
-    /// back for Keepalive-Timeout.
-    pub fn passive_keepalive_due(&self, now: Ticks) -> bool {
-        match self.last_data_rx {
-            None => false,
-            Some(rx) => {
-                let unanswered = self.last_any_tx.is_none_or(|tx| tx < rx);
-                unanswered && now.since(rx) >= KEEPALIVE_TIMEOUT
+    /// The deadline of `timer`, if armed.
+    pub(crate) fn get(&self, timer: Timer) -> Option<Ticks> {
+        self.deadlines.get(timer.slot()).copied().flatten()
+    }
+
+    pub(crate) fn is_armed(&self, timer: Timer) -> bool {
+        self.get(timer).is_some()
+    }
+
+    /// The earliest armed deadline.
+    pub(crate) fn next_wake(&self) -> Option<Ticks> {
+        self.deadlines.iter().flatten().copied().min()
+    }
+
+    /// Remove and return a timer whose deadline is at or before `now`,
+    /// with that deadline. When several are due, [`Timer::ALL`] decides
+    /// the order.
+    pub(crate) fn take_due(&mut self, now: Ticks) -> Option<(Timer, Ticks)> {
+        for timer in Timer::ALL {
+            if let Some(deadline) = self.get(timer) {
+                if deadline <= now {
+                    self.clear(timer);
+                    return Some((timer, deadline));
+                }
             }
         }
-    }
-
-    /// The instant a passive keepalive becomes due, if armed.
-    pub fn passive_keepalive_at(&self) -> Option<Ticks> {
-        let rx = self.last_data_rx?;
-        let unanswered = self.last_any_tx.is_none_or(|tx| tx < rx);
-        unanswered.then(|| rx.add_nanos(KEEPALIVE_TIMEOUT))
-    }
-
-    /// Dead-peer detection (§6.5): we sent data and heard *nothing* back
-    /// for Keepalive-Timeout + Rekey-Timeout.
-    pub fn dead_peer_due(&self, now: Ticks) -> bool {
-        if self.gave_up {
-            return false;
-        }
-        match self.last_data_tx {
-            None => false,
-            Some(tx) => {
-                let unanswered = self.last_any_rx.is_none_or(|rx| rx < tx);
-                unanswered && now.since(tx) >= DEAD_PEER_TIMEOUT
-            }
-        }
-    }
-
-    /// May persistent-keepalive start a fresh handshake attempt at `now`?
-    /// Always when not given-up; after `gave_up`, only once a full
-    /// keepalive interval has elapsed since the last initiation, so a
-    /// dead peer is probed once per interval rather than continuously.
-    pub fn persistent_revive_allowed(&self, now: Ticks, interval_ns: u64) -> bool {
-        if !self.gave_up {
-            return true;
-        }
-        self.last_initiation_tx
-            .is_none_or(|t| now.since(t) >= interval_ns)
-    }
-
-    pub fn dead_peer_at(&self) -> Option<Ticks> {
-        if self.gave_up {
-            return None;
-        }
-        let tx = self.last_data_tx?;
-        let unanswered = self.last_any_rx.is_none_or(|rx| rx < tx);
-        unanswered.then(|| tx.add_nanos(DEAD_PEER_TIMEOUT))
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
-    use crate::consts::KEEPALIVE_TIMEOUT;
-
-    const S: u64 = 1_000_000_000;
+    use std::collections::HashSet;
+    use std::vec::Vec;
 
     #[test]
-    fn initiation_pacing() {
-        let mut t = Timers::default();
-        assert!(t.initiation_allowed(Ticks::from_secs(0)));
-        t.note_initiation_tx(Ticks::from_secs(0), 0);
-        assert!(!t.initiation_allowed(Ticks::from_nanos(REKEY_TIMEOUT - 1)));
-        assert!(t.initiation_allowed(Ticks::from_nanos(REKEY_TIMEOUT)));
+    fn every_timer_has_its_own_slot_and_is_listed_once() {
+        let slots: HashSet<usize> = Timer::ALL.iter().map(|t| t.slot()).collect();
+        assert_eq!(slots.len(), COUNT);
+        assert!(slots.iter().all(|&s| s < COUNT));
+        let names: HashSet<Timer> = Timer::ALL.iter().copied().collect();
+        assert_eq!(names.len(), COUNT);
     }
 
     #[test]
-    fn retransmit_with_clamped_jitter() {
-        let mut t = Timers::default();
-        t.note_initiation_tx(Ticks::ZERO, u64::MAX);
+    fn arm_clear_and_query() {
+        let mut t = TimerTable::default();
+        assert_eq!(t.next_wake(), None);
+        assert!(!t.is_armed(Timer::SendKeepalive));
+
+        t.arm(Timer::SendKeepalive, Ticks::from_secs(10));
+        assert_eq!(t.get(Timer::SendKeepalive), Some(Ticks::from_secs(10)));
+        assert_eq!(t.get(Timer::NewHandshake), None);
+        assert_eq!(t.next_wake(), Some(Ticks::from_secs(10)));
+
+        // arm_if_idle keeps the running deadline; arm replaces it.
+        t.arm_if_idle(Timer::SendKeepalive, Ticks::from_secs(99));
+        assert_eq!(t.get(Timer::SendKeepalive), Some(Ticks::from_secs(10)));
+        t.arm_if_idle(Timer::NewHandshake, Ticks::from_secs(15));
+        assert_eq!(t.get(Timer::NewHandshake), Some(Ticks::from_secs(15)));
+        t.arm(Timer::SendKeepalive, Ticks::from_secs(20));
+        assert_eq!(t.get(Timer::SendKeepalive), Some(Ticks::from_secs(20)));
+        assert_eq!(t.next_wake(), Some(Ticks::from_secs(15)));
+
+        t.clear(Timer::NewHandshake);
+        assert_eq!(t.next_wake(), Some(Ticks::from_secs(20)));
+        t.clear(Timer::NewHandshake); // clearing an idle timer is a no-op
+        t.clear_all();
+        assert_eq!(t.next_wake(), None);
+    }
+
+    #[test]
+    fn take_due_fires_each_timer_once_and_only_when_due() {
+        let mut t = TimerTable::default();
+        t.arm(Timer::SendKeepalive, Ticks::from_secs(10));
+        t.arm(Timer::NewHandshake, Ticks::from_secs(15));
+
+        // Strictly before the earliest deadline: nothing.
+        assert_eq!(t.take_due(Ticks::from_nanos(10_000_000_000 - 1)), None);
+        // Exactly at it: that timer, once.
         assert_eq!(
-            t.retransmit_at,
-            Some(Ticks::from_nanos(REKEY_TIMEOUT + REKEY_TIMEOUT_JITTER_MAX))
+            t.take_due(Ticks::from_secs(10)),
+            Some((Timer::SendKeepalive, Ticks::from_secs(10)))
         );
-        // Attempt window persists across retransmissions.
-        t.note_initiation_tx(Ticks::from_nanos(REKEY_TIMEOUT), 0);
-        assert_eq!(t.attempt_started, Some(Ticks::ZERO));
-        assert!(!t.attempt_exhausted(Ticks::from_nanos(REKEY_ATTEMPT_TIME - 1)));
-        assert!(t.attempt_exhausted(Ticks::from_nanos(REKEY_ATTEMPT_TIME)));
+        assert_eq!(t.take_due(Ticks::from_secs(10)), None);
+        assert!(!t.is_armed(Timer::SendKeepalive));
+        // The other is untouched until its own deadline.
+        assert_eq!(t.next_wake(), Some(Ticks::from_secs(15)));
+        assert_eq!(
+            t.take_due(Ticks::from_secs(100)),
+            Some((Timer::NewHandshake, Ticks::from_secs(15)))
+        );
+        assert_eq!(t.next_wake(), None);
     }
 
     #[test]
-    fn passive_keepalive_arming() {
-        let mut t = Timers::default();
-        assert!(!t.passive_keepalive_due(Ticks::from_secs(100)));
-        // Receive data at t=10 with no reply: due at t=20.
-        t.note_rx(Ticks::from_secs(10), false);
-        assert!(!t.passive_keepalive_due(Ticks::from_secs(19)));
-        assert!(t.passive_keepalive_due(Ticks::from_secs(20)));
-        // Any send disarms.
-        t.note_keepalive_tx(Ticks::from_secs(20));
-        assert!(!t.passive_keepalive_due(Ticks::from_secs(40)));
-        // Keepalives received do NOT arm it (only data does).
-        let mut t = Timers::default();
-        t.note_rx(Ticks::from_secs(10), true);
-        assert!(!t.passive_keepalive_due(Ticks::from_secs(100)));
+    fn simultaneously_due_timers_come_out_in_service_order() {
+        let mut t = TimerTable::default();
+        // Arm everything, deliberately in the opposite order and with
+        // deadlines that would sort the other way round.
+        for (i, timer) in Timer::ALL.iter().rev().enumerate() {
+            t.arm(*timer, Ticks::from_secs(i as u64));
+        }
+        let mut order = Vec::new();
+        while let Some((timer, _)) = t.take_due(Ticks::from_secs(1000)) {
+            order.push(timer);
+        }
+        assert_eq!(order, Timer::ALL.to_vec());
     }
 
+    /// The property the table exists for: once nothing is due, the next
+    /// wake-up is strictly in the future.
     #[test]
-    fn dead_peer_arming() {
-        let mut t = Timers::default();
-        t.note_data_tx(Ticks::from_secs(10));
-        assert!(!t.dead_peer_due(Ticks::from_nanos(10 * S + DEAD_PEER_TIMEOUT - 1)));
-        assert!(t.dead_peer_due(Ticks::from_nanos(10 * S + DEAD_PEER_TIMEOUT)));
-        // A reply disarms.
-        t.note_rx(Ticks::from_secs(12), true);
-        assert!(!t.dead_peer_due(Ticks::from_secs(60)));
-        // Giving up suppresses it until the next data event.
-        let mut t = Timers::default();
-        t.note_data_tx(Ticks::from_secs(10));
-        t.note_gave_up();
-        assert!(!t.dead_peer_due(Ticks::from_secs(60)));
-        t.note_data_tx(Ticks::from_secs(70));
-        assert!(t.dead_peer_due(Ticks::from_nanos(70 * S + DEAD_PEER_TIMEOUT)));
-    }
-
-    #[test]
-    fn deadline_accessors_match_due_predicates() {
-        let mut t = Timers::default();
-        assert_eq!(t.passive_keepalive_at(), None);
-        assert_eq!(t.dead_peer_at(), None);
-        t.note_rx(Ticks::from_secs(10), false);
-        let at = t.passive_keepalive_at().unwrap();
-        assert_eq!(at, Ticks::from_nanos(10 * S + KEEPALIVE_TIMEOUT));
-        assert!(!t.passive_keepalive_due(at.add_nanos(0).min(Ticks::from_nanos(at.nanos() - 1))));
-        assert!(t.passive_keepalive_due(at));
-        t.note_data_tx(Ticks::from_secs(11));
-        let at = t.dead_peer_at().unwrap();
-        assert_eq!(at, Ticks::from_nanos(11 * S + DEAD_PEER_TIMEOUT));
-        assert!(t.dead_peer_due(at));
-        assert!(!t.dead_peer_due(Ticks::from_nanos(at.nanos() - 1)));
+    fn after_draining_next_wake_is_strictly_future() {
+        let mut t = TimerTable::default();
+        for (i, timer) in Timer::ALL.iter().enumerate() {
+            t.arm(*timer, Ticks::from_secs(3 * i as u64));
+        }
+        for now in [0u64, 4, 9, 9, 30] {
+            let now = Ticks::from_secs(now);
+            while t.take_due(now).is_some() {}
+            assert!(t.next_wake().is_none_or(|w| w > now));
+        }
     }
 }

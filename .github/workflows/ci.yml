@@ -4,111 +4,315 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
-# Only first-party `actions/*` actions are used. The Rust toolchain is set up
-# with plain `run:` steps via `rustup` (pre-installed on the GitHub-hosted
-# runners) rather than a third-party toolchain action — minimal profile, plus
-# the components/targets each job needs.
+  # The compilers everything below is checked with. Several jobs check
+  # what a build *contains* — no panic machinery, nothing of a key left
+  # on the stack, the same path through the code for every secret — and
+  # that is a statement about a compiler, so the compiler is named. Move
+  # these forward on purpose, and read what the jobs say when you do.
+  RUST_STABLE: "1.100.0"
+  RUST_NIGHTLY: nightly-2026-11-22
+  RUST_MSRV: "1.85"
+
+  # Warnings are errors — in the build this repository's
+  # .cargo/config.toml describes: AVX2 for the whole program on x86_64.
+  # These are the per-target forms on purpose. A plain RUSTFLAGS would
+  # not add to the config file's flags but replace them, and every job
+  # would test a build nobody else makes. (Where a step wants another
+  # build, it says RUSTFLAGS itself, which takes precedence.)
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -D warnings -C target-cpu=x86-64-v3
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -D warnings -C target-cpu=x86-64-v3
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -D warnings
+  CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS: -D warnings
+  CARGO_TARGET_X86_64_UNKNOWN_UEFI_RUSTFLAGS: -D warnings
+
+# Only first-party `actions/*` actions are used, each at a commit. The Rust
+# toolchain is set up with plain `run:` steps via `rustup` (pre-installed on
+# the GitHub-hosted runners) rather than a third-party toolchain action —
+# minimal profile, plus the components/targets each job needs.
 
 jobs:
   test:
     name: Test (stable)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (stable)
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
       - run: cargo test --all-targets
       - run: cargo test --doc
+      # Without the default features (the precomputed base-point table).
+      - run: cargo test --all-targets --no-default-features
+      # Optimised: some tests are about what an optimised build does (the
+      # frames that are overwritten at once after the cipher's workers).
+      - run: cargo test --release --lib
 
   lint:
     name: Clippy wall + rustfmt + docs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (stable + clippy, rustfmt)
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
           rustup component add clippy rustfmt
-      - run: cargo fmt --check
+      - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
 
-  no-panic:
-    name: Panic-freedom object scan
-    runs-on: ubuntu-latest
+  drivers:
+    name: std driver + SIMD keystreams (test, clippy)
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install Rust (stable + clippy)
+        run: |
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
+          rustup component add clippy
+      - run: cargo test -p wireguard-embed --features async
+      - run: cargo test -p wireguard-embed
+      - run: cargo test -p wireguard-chacha-simd
+      # Optimised: the kernels' frames must be overwritten at once (the
+      # test that says so has nothing to say about a slower build).
+      - run: cargo test --release -p wireguard-chacha-simd
+      - run: >-
+          cargo clippy -p wireguard-embed -p wireguard-chacha-simd
+          --features wireguard-embed/async --all-targets -- -D warnings
+      # Forged ICMP errors against the event loop, and the clock under a
+      # shifted boot-time clock. Needs namespaces of its own (network, for
+      # the raw socket; time); REQUIRE_NETNS makes "could not run" a
+      # failure instead of a silent skip.
+      - run: scripts/driver_netns_tests.sh
+        env:
+          REQUIRE_NETNS: 1
+      # The same two crates as a crate that depends on them builds them:
+      # without AVX2 at compile time (a dependency's .cargo/config.toml is
+      # not read), the keystream chosen when the program runs.
+      - name: Driver and SIMD crate as a dependent builds them
+        run: >-
+          cargo test -p wireguard-embed -p wireguard-chacha-simd
+          --features wireguard-embed/async --target-dir target/portable
+        env:
+          RUSTFLAGS: -D warnings -C target-cpu=x86-64
+
+  # The SIMD keystreams on CPUs this runner does not have, under
+  # emulation: NEON, and the fallback an x86_64 build without AVX2 takes
+  # on a CPU that has none. (Static musl binaries, linked with the
+  # toolchain's own linker: nothing but qemu-user to install.)
+  other-cpus:
+    name: SIMD keystreams on other CPUs (NEON; x86_64 without AVX2)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install Rust (stable + musl targets) and qemu-user
+        run: |
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
+          rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+      # Optimised, for the same reason as in the job above.
+      - name: NEON keystream (aarch64)
+        run: cargo test --release -p wireguard-chacha-simd --target aarch64-unknown-linux-musl
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER: qemu-aarch64
+      # A CPU model from before AVX2. If the run-time choice were wrong,
+      # the tests would die of an illegal instruction.
+      - name: Scalar fallback on an x86_64 CPU without AVX2
+        run: cargo test -p wireguard-chacha-simd --target x86_64-unknown-linux-musl
+        env:
+          RUSTFLAGS: -D warnings -C target-cpu=x86-64
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER: qemu-x86_64 -cpu Westmere
+
+  # Against the real thing: the kernel's WireGuard, in a private network
+  # namespace on the runner.
+  interop:
+    name: Interoperability with the Linux kernel's WireGuard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (stable)
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
+      - name: Load the kernel module
+        run: sudo modprobe wireguard
+      # Eight scenarios (both roles, with and without a pre-shared key,
+      # cookies, crossed handshakes, one-way streams). REQUIRE_NETNS makes
+      # "could not run" a failure instead of a silent skip.
+      - run: scripts/interop_netns.sh
+        env:
+          REQUIRE_NETNS: 1
+
+  # The next five jobs check properties the README claims by looking at
+  # what was actually built. Each script first shows that it can fail: a
+  # variant with the defect planted, or a control that must be flagged.
+  no-panic:
+    name: No panic machinery in the optimised image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The image is built by the stable compiler. The nightly one only
+      # describes the public API (rustdoc's JSON output), so that the
+      # image can be checked to contain all of it.
+      - name: Install Rust (stable + bare-metal target; nightly for rustdoc)
+        run: |
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
+          rustup target add x86_64-unknown-none
       - run: scripts/check_no_panic.sh
+        env:
+          NIGHTLY: ${{ env.RUST_NIGHTLY }}
+          REQUIRE_NIGHTLY: 1
 
   no-std:
-    name: Core-only target build
-    runs-on: ubuntu-latest
+    name: Links without std and without an allocator
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust (stable + uefi target)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install Rust (stable + bare-metal targets)
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          rustup target add x86_64-unknown-uefi
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
+          rustup target add x86_64-unknown-none x86_64-unknown-uefi
+      - run: scripts/check_no_std.sh
+      # A second no_std target, for the library alone.
       - run: cargo build --lib --target x86_64-unknown-uefi
+
+  secret-residue:
+    name: No secret left on the stack or in a dropped tunnel
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install Rust (stable + aarch64 musl target) and qemu-user
+        run: |
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
+          rustup target add aarch64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+      # Three builds on this machine, and the NEON keystream under
+      # emulation (REQUIRE_AARCH64: not being able to is a failure).
+      - run: scripts/check_secret_residue.sh
+        env:
+          REQUIRE_AARCH64: 1
+
+  constant-flow:
+    name: The same path through the code for every secret
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install Rust (stable + musl target) and qemu-user
+        run: |
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+      # Exact and repeatable: basic blocks executed, counted under
+      # emulation, for eight secrets per operation.
+      - run: scripts/check_constant_flow.sh
+        env:
+          REQUIRE_QEMU: 1
+      # Timing, on real hardware — a shared runner's, which is why this
+      # step informs and does not fail the job: the tests themselves say
+      # "too noisy" when they cannot tell.
+      - name: Timing tripwires (informational on a shared runner)
+        run: cargo test --release --test constant_time -- --ignored --test-threads=1 --nocapture
+        continue-on-error: true
 
   msrv:
     name: MSRV (1.85)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (1.85)
         run: |
-          rustup toolchain install 1.85 --profile minimal --no-self-update
-          rustup default 1.85
-      - run: cargo test --lib
+          rustup toolchain install "$RUST_MSRV" --profile minimal --no-self-update
+          rustup default "$RUST_MSRV"
+      # Everything, not the library's unit tests alone: the integration
+      # tests and examples, the doc tests, and the two other crates.
+      - run: cargo test --all-targets
+      - run: cargo test --doc
+      - run: cargo test --all-targets --no-default-features
+      - run: cargo test -p wireguard-chacha-simd
+      - run: cargo test -p wireguard-embed --features async
 
+  # The table, and a floor under the line coverage of the library
+  # (scripts/coverage.sh has the number and what it is for).
   coverage:
-    name: Coverage report
-    runs-on: ubuntu-latest
+    name: Coverage (report and floor)
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (stable + llvm-tools)
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
           rustup component add llvm-tools
       - run: scripts/coverage.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage
           path: target/coverage/coverage.txt
 
   fuzz-smoke:
-    name: Fuzz smoke (10s/target)
-    runs-on: ubuntu-latest
+    name: Fuzz smoke (30s/target, from the checked-in seeds)
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (nightly)
         run: |
-          rustup toolchain install nightly --profile minimal --no-self-update
-          rustup default nightly
-      - run: cargo install cargo-fuzz --locked
-      - run: scripts/fuzz_all.sh 10
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal --no-self-update
+          rustup default "$RUST_NIGHTLY"
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+      # Every target starts from fuzz/seeds/<target>: inputs that already
+      # reach the deep protocol states, so thirty seconds are spent
+      # exploring from there rather than rediscovering a handshake.
+      - run: scripts/fuzz_all.sh 30
+        env:
+          NIGHTLY: ${{ env.RUST_NIGHTLY }}
 
   bench-smoke:
     name: Bench smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust (stable)
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
       - run: cargo run --release --example perf -- --quick
+      # The comparative benchmark is a workspace of its own (it needs a
+      # BoringTun checkout next to this repository), so nothing else here
+      # builds it. Build it and run every benchmark once, so that an API
+      # change cannot break it unnoticed. The revision is the one the
+      # numbers in bench/README.md were measured against.
+      #
+      # BoringTun is a path dependency there, and a compiler's warnings
+      # about a path dependency are not capped the way a registry
+      # crate's are: "warnings are errors" would be about BoringTun's
+      # code. So this step says its flags without that; the benchmark
+      # crate denies warnings in its own manifest instead.
+      - name: Comparative benchmark builds and runs
+        run: |
+          git clone --quiet https://github.com/cloudflare/boringtun ../boringtun
+          git -C ../boringtun checkout --quiet 6dcc889a95ad82400932f785d874421d70308195
+          cd bench
+          cargo bench --bench compare --bench chacha -- --test
+          cargo build --release --bins
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v3
