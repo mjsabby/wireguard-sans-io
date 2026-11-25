@@ -167,9 +167,11 @@ and a 16-byte AEAD.
 A correct trigger says that this machine has more handshake work than it
 can do: the depth of the queue handshake messages wait in (the kernel:
 512 of them), or the time spent on handshake messages **that passed
-`mac1`** (`wireguard-embed`: more than a tenth of a second within one
-second). The rate of such messages works if the threshold is well above
-what your peers themselves send. Measure after `receive`, not before:
+`mac1`** (`wireguard-embed`: more than a tenth of the time — a budget
+that fills at a tenth of a second per second and holds ten milliseconds —
+and then for a second at the least, so that a flood does not get the
+signal to switch off and on). The rate of such messages works if the
+threshold is well above what your peers themselves send. Measure after `receive`, not before:
 counting anything shaped like a handshake message lets someone who does
 not even know your public key keep you "under load".
 
@@ -277,21 +279,84 @@ Poly1305 pass over all of it, which at 64 KiB is half an X25519. Clamp
 receives to the path MTU (or at most a few KB) rather than accepting
 64 KiB UDP datagrams.
 
-### 3.4 [AVAIL] If receiving on several threads, MUST NOT hold the device lock across the expensive calls
+### 3.4 [AVAIL] If receiving on several threads, MUST share the device by reference, not behind a lock
 
-`Device::receive` takes `&mut self` and is cheap for every input (a few
-dozen nanoseconds for a transport datagram; one keyed hash for a
-handshake message, three under load, five in the ten seconds after the
-cookie secret has changed); what it returns borrows only the datagram.
-`Device::identify`, the one X25519 an initiation costs before its peer is
-known, takes `&self`. So: share **one** device behind a reader-writer
-lock, hold it exclusively for `receive` only, hold it shared for
-`identify`, and call into the tunnel under the tunnel's own lock.
-Holding an exclusive device lock across `identify` or a tunnel call lets
-a flood of handshake initiations stall the routing of every peer's
-traffic. (One device, not one per thread: the key that makes session
-indices routable and the cookie secret are the device's, and two devices
-do not understand each other's.)
+Everything a `Device` needs in order to route is fixed when it is made.
+What changes while it receives is its counters and — under load only —
+the cookie secret. `Device::receive` and `Device::cookie_reply` keep both
+inside the device, and therefore take `&mut self`: they are the calls for
+one thread. With several threads use the pair that takes `&self`:
+
+```rust
+let device: Arc<Device> = …;                 // shared; no lock
+let cookies: RwLock<CookieState> = …;        // the only lock, and only under load
+// per thread:
+let mut stats = DeviceStats::default();
+let guard = under_load().then(|| cookies.read().unwrap());
+match device.receive_shared(guard.as_deref(), now, src, &mut datagram, &mut stats) {
+    Incoming::ForPeer(id, packet) => { /* that peer's tunnel, under its own lock */ }
+    Incoming::Initiation(mut init) => {
+        drop(guard);
+        // (the per-source limit of 3.2 goes here)
+        let Ok(public_key) = device.identify(&mut init) else { return };
+        // … look the peer up; tunnel.handle_initiation(now, &init, …)
+    }
+    Incoming::CookieRequired(challenge) => {
+        drop(guard);
+        let tx = device.cookie_reply_shared(
+            &mut cookies.write().unwrap(), now, &challenge, &mut out, &mut rng, &mut stats)?;
+        // … send it, or do not: see 3.5
+    }
+    _ => {}
+}
+```
+
+`receive_shared` does what `receive` does, at the same cost (a few dozen
+nanoseconds for a transport datagram; one keyed hash for a handshake
+message, three under load, five in the ten seconds after the cookie
+secret has changed), and `identify` — the one X25519 an initiation costs
+before its peer is known — takes `&self` as well. So no datagram waits
+for another thread: transport data touches no lock but its tunnel's, and
+handshake arithmetic runs next to it.
+
+**Do not put the device itself behind a lock** — neither a mutex nor a
+reader-writer lock. A mutex makes one queue of every datagram of every
+peer. A reader-writer lock held exclusively for `receive` and *shared*
+for `identify` — what this section used to prescribe — is worse than it
+looks: a shared hold keeps writers out, and `receive` is a writer, so
+every datagram of every peer waits for whichever initiation is being
+identified. Measured on four receive threads: one more thread fed forged
+initiations — 29,000 a second, 34 Mbit/s, from anyone who knows the
+public key — took routing from 7.4 million packets a second to under
+600; half a million valid-`mac1` messages a second under load (the cookie
+check and the reply inside the lock) took it to under a million.
+(`audit/src/bin/lock_scaling.rs` measures the device behind either lock
+and shared by reference; `tests/shared_device.rs` is about the shared
+calls, and its last test times them.)
+
+One `CookieState` per device, not one per thread: a cookie is good only
+for the state that made it. One device, not one per thread either: the
+key that makes session indices routable is the device's.
+
+### 3.5 [AVAIL] SHOULD bound what is spent on cookie replies
+
+Under load every handshake message that passes `mac1` without a cookie is
+answered with a cookie reply — 64 bytes to an address its sender chose,
+at the cost of a keyed hash and a 16-byte AEAD, and of a place in the
+socket's way out. The protocol asks for the reply; nothing obliges you to
+make one for every such message, and a flood of them should not come
+before what the tunnel itself has to send. Make replies with what is left
+over: after transport data and after handshake messages that carry a
+cookie, as many as there is time and room for, dropping the rest (the
+sender retransmits in five seconds — and whoever holds a cookie by then
+is let through). On an uplink that is much narrower than the downlink,
+cap them outright. (`wireguard-embed`'s event loop does the first by
+itself; `RateLimiter::with_cookie_reply_limit` is the cap.)
+
+Do **not** limit replies per source address: that address is unproven, so
+anyone who knows your public key could use up the replies of an address
+of their choosing — and the peer at that address, who needs one to get
+through while you are under load, would never see it.
 
 ---
 
@@ -769,7 +834,8 @@ test in the integrating system's test suite.
 - [ ] `under_load` asserted when handshake work exceeds what the machine can do (time spent on it, or queue depth) — not at a handful of messages a second
 - [ ] Load signal measures only handshake messages that passed `mac1`
 - [ ] Per-source token bucket consulted **only** for cookie-verified handshake messages (`source_verified()`), between `Device::receive` and `Device::identify` — never in front of `receive`
-- [ ] Device lock (if any) held exclusively for `Device::receive` only — not across `identify` or a tunnel call
+- [ ] Several receive threads: the device shared by reference (`receive_shared`, `cookie_reply_shared`, `identify`), no lock around it; one `CookieState`, its lock taken only under load
+- [ ] Cookie replies made with what is left over after traffic and proven handshakes — capped on a narrow uplink, never limited per source address
 - [ ] No socket error ends the receive loop; ICMP errors are counted (and used for PMTU), not fatal
 - [ ] With `IP_RECVERR` / `IPV6_RECVERR`: the socket's error queue is read empty whenever the socket reports an error
 - [ ] A send that fails is repeated (the error may be an earlier datagram's)

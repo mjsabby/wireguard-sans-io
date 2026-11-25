@@ -156,6 +156,30 @@ jobs:
         env:
           REQUIRE_NETNS: 1
 
+  # And against the reference userspace implementation, built from source
+  # at a pinned commit (the runner image has a Go toolchain; go.mod says
+  # which one the build wants, and `go` fetches it if it is another).
+  # The same eight scenarios, and stricter about them: what went into one
+  # end has to have come out of the other. One run in forty or so of the
+  # crossed-handshake scenario meets a race in wireguard-go itself, which
+  # its log identifies; the script does not count such a run and repeats
+  # the scenario (scripts/interop_wireguard_go.sh says how, and why that
+  # excuses nothing of ours).
+  interop-go:
+    name: Interoperability with wireguard-go
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
+      - run: scripts/build_wireguard_go.sh
+      - run: scripts/interop_wireguard_go.sh
+        env:
+          REQUIRE_NETNS: 1
+          REQUIRE_WIREGUARD_GO: 1
+
   # The next five jobs check properties the README claims by looking at
   # what was actually built. Each script first shows that it can fail: a
   # variant with the defect planted, or a control that must be flagged.
@@ -285,6 +309,33 @@ jobs:
       - run: scripts/fuzz_all.sh 30
         env:
           NIGHTLY: ${{ env.RUST_NIGHTLY }}
+
+  # The primitives against implementations this repository does not
+  # contain (which is why this is a workspace of its own and a job of its
+  # own: it fetches them), and the measuring programs, so that an API
+  # change cannot break them unnoticed.
+  audit:
+    name: Primitives against independent implementations and Wycheproof
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install "$RUST_STABLE" --profile minimal --no-self-update
+          rustup default "$RUST_STABLE"
+      - name: Differential tests
+        run: cargo test --locked
+        working-directory: audit
+      - name: The measuring programs build and run
+        working-directory: audit
+        run: |
+          cargo build --locked --release --bins --examples
+          target/release/attack_cost simd badmac1 1000
+          target/release/attack_cost scalar init-forged 100
+          target/release/attack_cost simd handshake-responder 100
+          target/release/many_peers simd 64 64 4
+          target/release/lock_scaling 2 1 cookie 100000 shared 0 2
+          target/release/lock_scaling 2 1 identify 100000 rwlock 0 2
 
   bench-smoke:
     name: Bench smoke
