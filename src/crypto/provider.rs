@@ -151,16 +151,28 @@ pub trait CryptoProvider: 'static {
 /// (`InTree<wireguard_chacha_simd::Best>`). Poly1305, BLAKE2s and X25519
 /// are always the in-tree scalar code.
 ///
-/// AEAD inputs of at most [`InTree::<C>::SCALAR_BELOW`] bytes — which
-/// covers every handshake AEAD (the largest plaintext is the 32-byte
-/// static key) — always take the scalar keystream, so handshake secrets
-/// never pass through a SIMD backend whatever `C` is.
+/// The handshake's AEADs always take the scalar keystream, so handshake
+/// secrets never pass through a SIMD backend whatever `C` is. They are
+/// the AEADs that have associated data (the transcript hash) and at most
+/// [`InTree::<C>::SCALAR_BELOW`] bytes of plaintext (the largest is the
+/// 32-byte static key), and that is how they are told from transport
+/// data, which has none. Transport packets that small take the scalar
+/// keystream too, unless `C` has a kernel for them
+/// ([`ChaChaImpl::SMALL_PACKETS`]).
 pub struct InTree<C: ChaChaImpl = Scalar>(PhantomData<C>);
 
 impl<C: ChaChaImpl> InTree<C> {
-    /// Plaintexts up to this many bytes use the scalar keystream regardless
-    /// of `C`.
+    /// Plaintexts up to this many bytes use the scalar keystream: with
+    /// associated data — the handshake's — regardless of `C`, and without
+    /// — transport packets — unless `C` asks for them
+    /// ([`ChaChaImpl::SMALL_PACKETS`]).
     pub const SCALAR_BELOW: usize = 64;
+
+    /// Is an AEAD over `len` bytes of plaintext with the associated data
+    /// `aad` the scalar keystream's?
+    fn scalar(aad: &[u8], len: usize) -> bool {
+        len <= Self::SCALAR_BELOW && (!C::SMALL_PACKETS || !aad.is_empty())
+    }
 }
 
 impl<C: ChaChaImpl> fmt::Debug for InTree<C> {
@@ -224,7 +236,7 @@ impl<C: ChaChaImpl> CryptoProvider for InTree<C> {
         buf: &mut [u8],
     ) -> Result<usize, Error> {
         let nonce = aead::nonce_from_counter(counter);
-        if pt_len <= Self::SCALAR_BELOW {
+        if Self::scalar(aad, pt_len) {
             aead::seal_in_place(key, &nonce, aad, pt_len, buf)
         } else {
             aead::seal_in_place_with::<C>(key, &nonce, aad, pt_len, buf)
@@ -233,7 +245,7 @@ impl<C: ChaChaImpl> CryptoProvider for InTree<C> {
 
     fn open_in_place(key: &[u8; 32], counter: u64, aad: &[u8], buf: &mut [u8]) -> Option<usize> {
         let nonce = aead::nonce_from_counter(counter);
-        if buf.len() <= Self::SCALAR_BELOW.saturating_add(aead::TAG_LEN) {
+        if Self::scalar(aad, buf.len().saturating_sub(aead::TAG_LEN)) {
             aead::open_in_place(key, &nonce, aad, buf).ok()
         } else {
             aead::open_in_place_with::<C>(key, &nonce, aad, buf).ok()
