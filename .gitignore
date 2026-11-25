@@ -2,6 +2,7 @@
 /target/
 /fuzz/target/
 /bench/target/
+/audit/target/
 /probes/target/
 /probes/freestanding/target/
 # bench is its own workspace (excluded from the parent because of the

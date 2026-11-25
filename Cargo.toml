@@ -16,13 +16,14 @@ readme = "README.md"
 exclude = [".github/", ".cargo/", "scripts/", ".gitignore"]
 
 # Workspace: the no_std core (this package) plus the std-driving wrapper
-# and the SIMD backends. The fuzz harness and the comparative benchmark
-# crate are excluded so their out-of-tree dependencies (nightly +
-# libfuzzer for fuzz; a sibling `../../boringtun` path checkout for
-# bench) cannot break library builds or CI workspace resolution.
+# and the SIMD backends. The fuzz harness, the comparative benchmark
+# crate and the audit harness are excluded so their out-of-tree
+# dependencies (nightly + libfuzzer for fuzz; a sibling `../../boringtun`
+# path checkout for bench; the reference implementations audit compares
+# with) cannot break library builds or CI workspace resolution.
 [workspace]
 members = ["embed", "simd"]
-exclude = ["fuzz", "bench"]
+exclude = ["fuzz", "bench", "audit"]
 
 [features]
 default = ["x25519-table"]
