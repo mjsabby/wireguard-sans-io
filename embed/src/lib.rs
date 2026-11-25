@@ -30,12 +30,12 @@
 //! | clock | caller passes `Ticks` | [`Tunn::now`]: a clock that keeps counting while the machine is suspended, where there is one (`CLOCK_BOOTTIME` on Linux and Android; `Instant` elsewhere), read by every call — or once per batch by the caller, who passes the reading to the `_at` form of each call. (`SystemTime` is read once, for the handshake-timestamp anchor.) |
 //! | entropy | caller passes `&mut dyn EntropySource` | OS RNG via `getrandom` |
 //! | keys in memory | caller builds `Device` and `Tunnel` where they are to stay | both behind a `Box` of their own, so a [`Tunn`] can be moved without its keys; the constructors leave nothing of the keys on the stack and wipe the copies they are given; [`Tunn::with_keys`] takes them by reference |
-//! | rate limit / `under_load` | caller decides | built-in [`RateLimiter`]: under load once handshake messages have taken a tenth of a second within one second (or, if you say so, once there have been so many), plus the kernel's per-source token bucket for sources a cookie has proven |
+//! | rate limit / `under_load` | caller decides | built-in [`RateLimiter`]: under load once handshake messages have taken more time than a budget that fills at a tenth of a second per second and holds ten milliseconds (or, if you say so, once there have been so many), plus the kernel's per-source token bucket for sources a cookie has proven — and for the blocks of addresses they are in — and, if asked, a cap on cookie replies |
 //! | padding vs. path MTU | caller passes the tunnel MTU | [`DEFAULT_MTU`] (1420) unless [`Tunn::set_mtu`] says otherwise |
 //! | packet queue while no session | caller retries | internal `VecDeque` of at most [`MAX_QUEUE_DEPTH`] packets, none older than [`MAX_QUEUE_AGE`], drained in order once a session is usable |
 //! | padding trim on receive | caller calls `ip_packet_len` | done for you |
 //! | buffer management | caller-provided slices | [`SlabPool`] + RAII [`PooledBuf`]: bounded freelist of `Box<[u8]>` slabs (stable address ⇒ io_uring/RIO-ready); steady-state data path is allocation-free |
-//! | async runtime | n/a | feature `async`: `tokio::AsyncTunn` — an event loop over a `UdpSocket`, the tunnel's timers and two `mpsc<PooledBuf>` channels for the TUN side, which never waits on the socket and reads its error queue |
+//! | async runtime | n/a | feature `async`: `tokio::AsyncTunn` — an event loop over a `UdpSocket`, the tunnel's timers and two `mpsc<PooledBuf>` channels for the TUN side, which never waits on the socket, reads its error queue, and does handshake arithmetic and cookie replies with the time traffic leaves it |
 //!
 //! What it deliberately does **not** add is protocol: which peer a
 //! datagram is for, where the peer currently is, when a session is usable,
@@ -107,6 +107,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clock::Clock;
 use wireguard_sans_io::crypto::ct;
 
+#[cfg(feature = "async")]
+use wireguard_sans_io::CookieChallenge;
 use wireguard_sans_io::{
     Device, DeviceStats, DropReason, Encapsulated, Error, Handled, InTree, Incoming, PeerConfig,
     PeerId, PollOutput, PresharedKey, PublicKey, Received, StaticSecret, Ticks, Transmit, Tunnel,
@@ -188,9 +190,12 @@ pub enum TunnError {
     /// smaller than the datagrams you mean to receive: give it the size
     /// of your receive buffer.
     TooLong,
-    /// A handshake message from a source that has used up its allowance
-    /// (see [`RateLimiter`]). Dropped without doing any Diffie-Hellman
-    /// work; the sender's own retransmission timer tries again.
+    /// A handshake message that a limit kept from being answered (see
+    /// [`RateLimiter`]): its source — proven by a cookie — has used up
+    /// its allowance, or, under load, it had no cookie and the cap on
+    /// cookie replies was reached. Dropped without doing any
+    /// Diffie-Hellman work; the sender's own retransmission timer tries
+    /// again.
     RateLimited,
     /// The handshake attempt was abandoned after `Rekey-Attempt-Time`;
     /// the packets queued for it were dropped.
@@ -206,7 +211,7 @@ impl std::fmt::Display for TunnError {
             Self::Core(e) => write!(f, "{e}"),
             Self::Dropped(r) => write!(f, "datagram dropped: {r}"),
             Self::TooLong => f.write_str("datagram dropped: longer than the buffer for it"),
-            Self::RateLimited => f.write_str("handshake message dropped: source over its limit"),
+            Self::RateLimited => f.write_str("handshake message dropped: over a rate limit"),
             Self::HandshakeExpired => f.write_str("handshake attempt abandoned"),
             Self::SessionsExpired => f.write_str("sessions expired and were wiped"),
         }
@@ -355,11 +360,11 @@ impl Tunn {
     ///
     /// `rate_limiter`: pass `None` to get a private limiter with the
     /// default load signal (cookies are demanded once handshake messages
-    /// have taken a tenth of a second within one second:
-    /// [`RateLimiter::default`]), or one `Arc` to several `Tunn`s to give
-    /// them a common load signal and a common allowance per source
-    /// address. (Each `Tunn` still needs a socket of its own: see the
-    /// crate documentation.)
+    /// take more than a tenth of the time, ten milliseconds of it at
+    /// once: [`RateLimiter::default`]), or one `Arc` to several `Tunn`s
+    /// to give them a common load signal and a common allowance per
+    /// source address. (Each `Tunn` still needs a socket of its own: see
+    /// the crate documentation.)
     ///
     /// The tunnel assumes a tunnel-interface MTU of [`DEFAULT_MTU`]; if
     /// your TUN device has another, say so with [`Tunn::set_mtu`].
@@ -1064,6 +1069,20 @@ impl Tunn {
                 )
                 .map(Inbound::Handled);
         }
+        self.receive_handshake(now, src, datagram, out)
+    }
+
+    /// [`Tunn::receive`] for a handshake message: steps 1 to 3 there.
+    /// Out of line, so that what the limiter needs — which is not little
+    /// — is not laid out in the middle of the data path.
+    #[inline(never)]
+    fn receive_handshake<'a>(
+        &mut self,
+        now: Ticks,
+        src: SocketAddr,
+        datagram: &'a mut [u8],
+        out: &'a mut [u8],
+    ) -> Result<Inbound<'a>, Error> {
         // The limiter's clock, once: for the window, the count and the
         // source's bucket, and as the start of what this message costs.
         let limiter = &self.rate_limiter;
@@ -1092,9 +1111,13 @@ impl Tunn {
             }
             Incoming::CookieRequired(challenge) => {
                 let _ = limiter.note_handshake_at(started);
-                self.device
-                    .cookie_reply(now, &challenge, out, &mut self.rng)
-                    .map(Inbound::Cookie)
+                if limiter.allow_cookie_reply_at(started) {
+                    self.device
+                        .cookie_reply(now, &challenge, out, &mut self.rng)
+                        .map(Inbound::Cookie)
+                } else {
+                    Ok(Inbound::Refused(TunnError::RateLimited))
+                }
             }
             // What did not pass the `mac1` check is not counted and not
             // timed: it says nothing about load that a stranger could not
@@ -1106,6 +1129,119 @@ impl Tunn {
         };
         self.rate_limiter.note_handshake_time_since(started);
         outcome
+    }
+
+    /// The first half of [`Tunn::receive`], for a caller that does the
+    /// second half later (the event loop): what kind of datagram is this,
+    /// and is it worth any more work?
+    ///
+    /// For a handshake message this makes the cheap checks — `mac1`,
+    /// under load the cookie, for a proven source its allowance — and
+    /// stops there: nothing expensive has been done, and what is left to
+    /// do is the caller's to schedule ([`Tunn::deferred_handshake_at`],
+    /// [`Tunn::cookie_reply_at`]). Counting, and the time it took, go to
+    /// the load signal as in `receive`.
+    #[cfg(feature = "async")]
+    pub(crate) fn triage(&mut self, now: Ticks, src: SocketAddr, datagram: &mut [u8]) -> Triage {
+        if !is_handshake(datagram) {
+            return Triage::Now;
+        }
+        let limiter = &self.rate_limiter;
+        let started = limiter.now_ns();
+        let under_load = limiter.is_under_load_at(started);
+        let verdict = match self.device.receive(now, src, under_load, datagram) {
+            Incoming::Initiation(initiation) => {
+                let _ = limiter.note_handshake_at(started);
+                if initiation.source_verified() && !limiter.allow_source_at(src.ip(), started) {
+                    Triage::Refused
+                } else {
+                    Triage::Handshake
+                }
+            }
+            Incoming::ForPeer(_, packet) => {
+                let _ = limiter.note_handshake_at(started);
+                if packet.source_verified() && !limiter.allow_source_at(src.ip(), started) {
+                    Triage::Refused
+                } else {
+                    Triage::Handshake
+                }
+            }
+            Incoming::CookieRequired(challenge) => {
+                let _ = limiter.note_handshake_at(started);
+                Triage::Challenge(challenge)
+            }
+            // As in `receive`: neither counted nor timed.
+            _ => return Triage::Refused,
+        };
+        self.rate_limiter.note_handshake_time_since(started);
+        verdict
+    }
+
+    /// The second half, for a handshake message that [`Tunn::triage`]
+    /// called [`Triage::Handshake`]: the tunnel's part — the
+    /// Diffie-Hellman operations — and the answer, if there is one, in
+    /// `out` (92 bytes).
+    ///
+    /// The checks triage made were counted then. They are made once more
+    /// here, a keyed hash, because that is the only way to the core's
+    /// `Initiation`; the counters of that second look are not kept.
+    #[cfg(feature = "async")]
+    pub(crate) fn deferred_handshake_at<'a>(
+        &mut self,
+        now: Ticks,
+        src: SocketAddr,
+        datagram: &'a mut [u8],
+        out: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        let started = self.rate_limiter.now_ns();
+        let mut uncounted = DeviceStats::default();
+        let handled = match self
+            .device
+            .receive_shared(None, now, src, datagram, &mut uncounted)
+        {
+            Incoming::Initiation(initiation) => self
+                .tunnel
+                .handle_initiation(now, &initiation, out, &mut self.rng)
+                .map(Some),
+            Incoming::ForPeer(_, packet) => self.tunnel.handle(now, src, packet).map(Some),
+            _ => Ok(None),
+        };
+        self.rate_limiter.note_handshake_time_since(started);
+        match handled {
+            Ok(Some(handled)) => match handled.received {
+                Received::HandshakeResponse(tx) | Received::CookieReply(tx) => {
+                    TunnResult::WriteToNetwork(tx.datagram, tx.dst)
+                }
+                Received::Dropped(reason) => TunnResult::Err(TunnError::Dropped(reason)),
+                _ => TunnResult::Done,
+            },
+            Ok(None) => TunnResult::Err(TunnError::Dropped(DropReason::Malformed)),
+            Err(e) => TunnResult::Err(TunnError::Core(e)),
+        }
+    }
+
+    /// The cookie reply for a handshake message that [`Tunn::triage`]
+    /// called [`Triage::Challenge`], in `out` (64 bytes) — unless the
+    /// limiter's cap on cookie replies says no
+    /// ([`TunnError::RateLimited`]).
+    #[cfg(feature = "async")]
+    pub(crate) fn cookie_reply_at<'a>(
+        &mut self,
+        now: Ticks,
+        challenge: &CookieChallenge,
+        out: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        let limiter = &self.rate_limiter;
+        let started = limiter.now_ns();
+        if !limiter.allow_cookie_reply_at(started) {
+            return TunnResult::Err(TunnError::RateLimited);
+        }
+        let reply = self.device.cookie_reply(now, challenge, out, &mut self.rng);
+        self.rate_limiter.note_handshake_time_since(started);
+        match reply {
+            Ok(tx) => TunnResult::WriteToNetwork(tx.datagram, tx.dst),
+            Err(e) => TunnResult::Err(TunnError::Core(e)),
+        }
     }
 
     /// One `poll` of the core, as a `TunnResult`.
@@ -1217,6 +1353,24 @@ impl Tunn {
         }
         EncapStep::Queued
     }
+}
+
+/// What [`Tunn::triage`] made of a datagram that has just arrived.
+#[cfg(feature = "async")]
+pub(crate) enum Triage {
+    /// Not a handshake message — transport data, a cookie reply, noise:
+    /// to be processed at once ([`Tunn::decapsulate_in_place_at`]).
+    Now,
+    /// A handshake message that passed the cheap checks. What it costs
+    /// comes next: [`Tunn::deferred_handshake_at`], when there is time.
+    Handshake,
+    /// Under load, a handshake message without a cookie: a cookie reply
+    /// can be made for it ([`Tunn::cookie_reply_at`]) — when there is
+    /// time, and if there is.
+    Challenge(CookieChallenge),
+    /// Dropped — a wrong `mac1`, or a proven source that is over its
+    /// allowance: nothing more to do.
+    Refused,
 }
 
 /// What became of the packet given to [`Tunn::encapsulate`].
@@ -2470,6 +2624,65 @@ mod tests {
         establish(&mut a, &mut b);
     }
 
+    /// Triage — the event loop's first look at a datagram — is for
+    /// handshake messages. Transport data and cookie replies are passed
+    /// straight on: no limiter clock, no counter, nothing decoded.
+    #[cfg(feature = "async")]
+    #[test]
+    fn triage_passes_everything_but_handshake_messages_straight_on() {
+        let (mut a, mut b) = pair();
+        establish(&mut a, &mut b);
+        let mut dst = [0u8; 2048];
+        let (mut wire, _) = net(a.encapsulate(&ip_packet(64, 0x11), &mut dst));
+        let reads = b.rate_limiter().clock_reads();
+        let spent = b.rate_limiter().spent_ns();
+        let stats = b.device_stats();
+        let now = b.now();
+        assert!(matches!(b.triage(now, a_addr(), &mut wire), Triage::Now));
+        let mut cookie_reply = [0u8; 64];
+        cookie_reply[0] = 3;
+        assert!(matches!(
+            b.triage(now, a_addr(), &mut cookie_reply),
+            Triage::Now
+        ));
+        assert!(matches!(b.triage(now, a_addr(), &mut []), Triage::Now));
+        assert!(matches!(
+            b.triage(now, a_addr(), &mut [0xff; 148]),
+            Triage::Now
+        ));
+        assert_eq!(b.rate_limiter().clock_reads(), reads);
+        assert!(b.device_stats() == stats);
+        // A handshake message with a wrong `mac1` is refused there and
+        // then — counted by the device, and not by the load signal.
+        let mut junk = [0u8; 148];
+        junk[0] = 1;
+        assert!(matches!(
+            b.triage(now, a_addr(), &mut junk),
+            Triage::Refused
+        ));
+        assert_eq!(b.device_stats().mac1_failures, stats.mac1_failures + 1);
+        assert_eq!(b.rate_limiter().spent_ns(), spent);
+        // One that knows the public key is put off, and the work it asks
+        // for is done when its turn comes.
+        let mut init = strangers_initiation(b.device().public_key());
+        assert!(matches!(
+            b.triage(now, a_addr(), &mut init),
+            Triage::Handshake
+        ));
+        assert_eq!(b.device_stats().initiations, stats.initiations + 1);
+        let mut out = [0u8; 128];
+        assert!(matches!(
+            b.deferred_handshake_at(now, a_addr(), &mut init, &mut out),
+            TunnResult::Err(_)
+        ));
+        assert_eq!(
+            b.device_stats().initiations,
+            stats.initiations + 1,
+            "counted once, on arrival"
+        );
+        assert!(b.rate_limiter().spent_ns() > spent, "and timed");
+    }
+
     /// A handshake initiation from someone who knows `public` and nothing
     /// else.
     fn strangers_initiation(public: PublicKey) -> Vec<u8> {
@@ -2531,10 +2744,9 @@ mod tests {
             TunnResult::WriteToTunnel(_)
         ));
         assert_eq!(limiter.spent_ns(), after_initiation);
-        // None of this was load by the default budget. (A tenth of a
-        // second of handshake work within one second would be — on a
-        // machine that takes that long over three messages this test is
-        // right to fail.)
+        // None of this was load by the default budget. (Ten milliseconds
+        // of handshake work at once would be — on a machine that takes
+        // that long over three messages this test is right to fail.)
         assert!(!limiter.is_under_load());
 
         // A message that is answered with a cookie is timed as well.

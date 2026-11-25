@@ -30,6 +30,46 @@
 //! the packets it delivers: checking a packet's inner source address
 //! against the peer's allowed IPs is the TUN side's job.
 //!
+//! # Traffic first
+//!
+//! What arrives is not all worth the same. A transport datagram is dealt
+//! with at once: decrypted (or rejected, which is cheaper) and passed on.
+//! A handshake message is only *looked at* when it arrives — the keyed
+//! hashes that say whether it knows our public key and, under load,
+//! whether it holds a cookie — and then waits:
+//!
+//! * one that passed is queued, at most thirty-two of them, and its
+//!   Diffie-Hellman operations are done when the socket has been read;
+//! * one that needs a cookie first is remembered as the forty bytes the
+//!   reply is made from, at most 256 of them, and the reply is made
+//!   after everything else;
+//! * one that passed neither check is dropped on the spot.
+//!
+//! While the socket has no more than the loop can take at a time, what
+//! waits is done within the same turn: for a quarter of a millisecond at
+//! a stretch when the socket had nothing, and for less the more it had,
+//! so that what arrives meanwhile stays a fraction of what the loop takes
+//! at a time. While the socket has more than that — a flood — handshake
+//! work gets a third of the loop's time and traffic the rest; what does
+//! not fit the two queues is dropped and counted
+//! ([`LoopStats::handshake_drops`], [`LoopStats::cookie_reply_drops`]),
+//! and a cookie reply the socket has no room for is dropped rather than
+//! put in the way of the tunnel's own datagrams. So a flood of handshake
+//! messages — which anyone who knows our public key can send — costs
+//! handshakes, as it must (theirs wait for a cookie; that is the
+//! protocol's defence), and does not cost the session that is up: its
+//! packets are neither kept waiting behind someone else's X25519 nor
+//! behind replies to strangers.
+//!
+//! (It used to: every datagram was dealt with in full, in the order it
+//! came. With the load signal of the time — a tenth of each second, all
+//! of it up front — 150,000 forged initiations a second cost a tunnel a
+//! tenth of a second of deafness every second, and 400,000 all of it.
+//! `embed/tests/flood.rs` measures what they cost now: nothing, up to
+//! what the loop can look at — half a million a second on the machine
+//! this was written on — and beyond that what the socket's buffer has no
+//! room for, the session's datagrams at the same odds as the flood's.)
+//!
 //! # When things go wrong
 //!
 //! Nothing that arrives from the network, and nothing the rest of the
@@ -160,9 +200,9 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
-use wireguard_sans_io::{DeviceStats, Error, Stats, Ticks};
+use wireguard_sans_io::{CookieChallenge, DeviceStats, Error, Stats, Ticks};
 
-use crate::{PLAINTEXT_OFFSET, PooledBuf, SlabPool, Tunn, TunnError, TunnResult};
+use crate::{PLAINTEXT_OFFSET, PooledBuf, SlabPool, Triage, Tunn, TunnError, TunnResult};
 
 /// How long to wait before retrying after the core reports a local fault
 /// (for example an entropy failure), so a persistent fault cannot spin
@@ -210,6 +250,29 @@ const WRITE_RETRY: Duration = Duration::from_millis(1);
 /// having handed control back to the runtime.
 const YIELD_EVERY: u32 = 32;
 
+/// How many handshake messages that passed the cheap checks wait for
+/// their Diffie-Hellman operations, at the most. One peer sends one every
+/// five seconds; the rest of a full queue is somebody's flood, and what
+/// arrives at it is dropped.
+const HANDSHAKE_QUEUE: usize = 32;
+
+/// How many cookie replies are owed at the most (forty bytes each, the
+/// part of a handshake message the reply is made from).
+const COOKIE_QUEUE: usize = 256;
+
+/// The longest stretch of handshake work — queued handshake messages,
+/// then cookie replies — between two looks at the socket: what a packet
+/// may be kept waiting by it, and what the loop allows itself when the
+/// socket had nothing. When it had something, the stretch is shorter in
+/// proportion (see [`Allowance::refill`]). (At least one item is done
+/// whatever it takes: a handshake answered is about half of this.)
+const DEFERRED_SLICE: Duration = Duration::from_micros(250);
+
+/// While the socket has more waiting than the loop takes at a time,
+/// handshake work is given one part of time for every this many parts
+/// spent receiving: a third of the loop, with two.
+const DEFERRED_SHARE: u64 = 2;
+
 /// How often, at most, the loop looks at the machine's clocks (for a
 /// suspend, and for whether tokio's clock is in step with them). In
 /// between, one reading of tokio's clock per wake-up is all it takes.
@@ -219,6 +282,60 @@ const CLOCK_LOOK: Duration = Duration::from_millis(1);
 /// the loop started and still count as the same clock. (Unpaused they
 /// *are* the same clock, read a few nanoseconds apart.)
 const STEADY_SLACK_NS: u64 = 100_000_000;
+
+/// How much time handshake work may still take before the loop looks at
+/// the socket again, in nanoseconds (see the module docs, "Traffic
+/// first"). Negative: it has taken more than its share, and waits until
+/// receiving has made up for that.
+#[derive(Debug, Default)]
+struct Allowance(i64);
+
+impl Allowance {
+    /// The socket was read empty, `room` datagrams short of the
+    /// [`BATCH`] the loop takes at a time: whatever was owed, that part
+    /// of a [`DEFERRED_SLICE`] — all of it after a look that found
+    /// nothing, a thirty-second of it after one that found a datagram
+    /// less than a batch.
+    ///
+    /// What the socket held is what arrived during the last stretch, so
+    /// this is a stretch that shrinks as traffic grows: the datagrams
+    /// that wait for it to end stay a fraction of a batch, where a fixed
+    /// quarter of a millisecond is a hundred datagrams of a flood the
+    /// loop could otherwise just keep up with — half a socket buffer of
+    /// the default size, and with a little bad luck all of it.
+    fn refill(&mut self, room: usize) {
+        let room = i64::try_from(room.clamp(1, BATCH)).unwrap_or(1);
+        let batch = i64::try_from(BATCH).unwrap_or(i64::MAX);
+        let part = slice_ns()
+            .saturating_mul(room)
+            .checked_div(batch)
+            .unwrap_or(0);
+        self.0 = self.0.max(part.max(1));
+    }
+
+    /// Receiving took `receiving` while the socket was backed up:
+    /// handshake work has earned its share of that — one part in
+    /// [`DEFERRED_SHARE`], never more than a slice in all.
+    fn earn(&mut self, receiving: Duration) {
+        let share = nanos(receiving).checked_div(DEFERRED_SHARE).unwrap_or(0);
+        self.0 = self
+            .0
+            .saturating_add(i64::try_from(share).unwrap_or(i64::MAX))
+            .min(slice_ns());
+    }
+
+    /// Handshake work took `took`.
+    fn spend(&mut self, took: Duration) {
+        self.0 = self
+            .0
+            .saturating_sub(i64::try_from(nanos(took)).unwrap_or(i64::MAX));
+    }
+
+    /// May another item be done?
+    fn open(&self) -> bool {
+        self.0 > 0
+    }
+}
 
 /// What the running loop knows: what it could not deliver, and what the
 /// tunnel it owns has counted. Shared with the loop: take the handle from
@@ -233,6 +350,8 @@ pub struct LoopStats {
     error_queue_messages: AtomicU64,
     tun_drops: AtomicU64,
     oversize_drops: AtomicU64,
+    handshake_drops: AtomicU64,
+    cookie_reply_drops: AtomicU64,
     wakeups: AtomicU64,
     /// The tunnel's own figures, as of the loop's last iteration.
     published: Mutex<Published>,
@@ -316,6 +435,24 @@ impl LoopStats {
         self.oversize_drops.load(Ordering::Relaxed)
     }
 
+    /// Handshake messages that passed the cheap checks and were dropped
+    /// all the same, because thirty-two such were already waiting for
+    /// their turn: more of them than the loop had time for. Their senders
+    /// retransmit.
+    #[must_use]
+    pub fn handshake_drops(&self) -> u64 {
+        self.handshake_drops.load(Ordering::Relaxed)
+    }
+
+    /// Cookie replies that were owed and not made: too many were waiting
+    /// already, the socket had no room, or the limiter's cap on them was
+    /// reached ([`crate::RateLimiter::with_cookie_reply_limit`]). Under
+    /// a flood this is where most of it ends.
+    #[must_use]
+    pub fn cookie_reply_drops(&self) -> u64 {
+        self.cookie_reply_drops.load(Ordering::Relaxed)
+    }
+
     /// How often the loop has woken up: once for every batch of
     /// datagrams or packets, and for every timer. (A loop that is idle
     /// wakes up for the tunnel's timers and, where the clock counts time
@@ -382,6 +519,15 @@ pub struct AsyncTunn {
     /// out, each with where it goes. While there are any, nothing new is
     /// made: see the module docs.
     outbox: VecDeque<(PooledBuf, SocketAddr)>,
+    /// Handshake messages that passed the cheap checks, each with where
+    /// it came from, waiting for the expensive part (see the module docs,
+    /// "Traffic first").
+    handshakes: VecDeque<(PooledBuf, SocketAddr)>,
+    /// Cookie replies that are owed.
+    challenges: VecDeque<CookieChallenge>,
+    /// The time handshake work may still take before the loop looks at
+    /// the socket again.
+    deferred: Allowance,
     /// What the socket is to answer instead of being asked.
     #[cfg(test)]
     script: Arc<Script>,
@@ -553,6 +699,11 @@ fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// [`DEFERRED_SLICE`] in nanoseconds, as an allowance.
+fn slice_ns() -> i64 {
+    i64::try_from(nanos(DEFERRED_SLICE)).unwrap_or(i64::MAX)
+}
+
 /// `instant + wait`, or as near as an `Instant` gets.
 fn after(instant: TokioInstant, wait: Duration) -> TokioInstant {
     instant
@@ -579,6 +730,9 @@ impl AsyncTunn {
             pool,
             stats: Arc::default(),
             outbox: VecDeque::with_capacity(OUTBOX_DEPTH),
+            handshakes: VecDeque::with_capacity(HANDSHAKE_QUEUE),
+            challenges: VecDeque::with_capacity(COOKIE_QUEUE),
+            deferred: Allowance::default(),
             #[cfg(test)]
             script: Arc::default(),
         };
@@ -703,6 +857,12 @@ impl AsyncTunn {
         let mut published = Published::default();
         // Turns of the loop since the task last stepped aside.
         let mut turns = 0u32;
+        // How many datagrams short of a full batch the last look at the
+        // socket was. Zero: it found more than the loop takes at a time,
+        // the socket is backed up. (After such a look tokio still holds
+        // the socket to be readable, so the next one is not far off:
+        // a zero cannot go stale while the socket is idle.)
+        let mut room = BATCH;
 
         loop {
             let Reading {
@@ -739,6 +899,13 @@ impl AsyncTunn {
                     // The core reported a local fault and the work is
                     // still due: wait a little instead of spinning on it.
                     wake = wake.max(after(instant, FAULT_BACKOFF));
+                }
+                // Handshake work that did not fit the last stretch: back
+                // for it at once. (Not while the socket is backed up:
+                // its own events bring the loop round, and the share of
+                // handshake work is counted against them.)
+                if self.has_deferred() && room > 0 {
+                    wake = instant;
                 }
             }
             // While receiving is paused, wake up when the pause ends.
@@ -784,10 +951,13 @@ impl AsyncTunn {
                         self.error_signalled();
                     }
                     full = true;
+                    let batch_started = std::time::Instant::now();
+                    let mut taken = 0usize;
                     for _ in 0..BATCH {
                         match self.wire_recv(slabs.rx.spare_mut()) {
                             Ok((len, src)) => {
                                 streak.progress();
+                                taken = taken.saturating_add(1);
                                 if !self.on_datagram(now, len, src, &mut slabs, &from_net) {
                                     return Ok(()); // consumer gone
                                 }
@@ -813,6 +983,12 @@ impl AsyncTunn {
                                 }
                             }
                         }
+                    }
+                    if full {
+                        room = 0;
+                        self.deferred.earn(batch_started.elapsed());
+                    } else {
+                        room = BATCH.saturating_sub(taken).max(1);
                     }
                 }
 
@@ -867,6 +1043,11 @@ impl AsyncTunn {
                 }
             }
 
+            // What was put off: handshake messages that passed the cheap
+            // checks, then cookie replies — as much as traffic leaves
+            // time for (see the module docs, "Traffic first").
+            self.serve_deferred(now, &mut slabs, room);
+
             // A turn of this loop does not necessarily pass through the
             // runtime: `select!` returns at once when one of its branches
             // is ready, and tokio does not meter waiting for a socket the
@@ -918,6 +1099,40 @@ impl AsyncTunn {
             Reply(usize, SocketAddr),
             Nothing,
         }
+        // A handshake message is only looked at now; what it costs is
+        // done when traffic has been seen to (`serve_deferred`).
+        match self.tunn.triage(
+            now,
+            src,
+            slabs.rx.spare_mut().get_mut(..len).unwrap_or(&mut []),
+        ) {
+            Triage::Now => {}
+            Triage::Handshake => {
+                // A full queue gives up its oldest: a handshake message
+                // is worth less the longer it has waited (its sender
+                // starts over after five seconds), and whatever kept the
+                // queue from being served has kept that one longest.
+                if self.handshakes.len() >= HANDSHAKE_QUEUE && self.handshakes.pop_front().is_some()
+                {
+                    LoopStats::count(&self.stats.handshake_drops);
+                }
+                // The slab goes with the message; a fresh one takes its
+                // place.
+                slabs.rx.set_len(len);
+                let held = std::mem::replace(&mut slabs.rx, self.pool.get());
+                self.handshakes.push_back((held, src));
+                return true;
+            }
+            Triage::Challenge(challenge) => {
+                // The same: the oldest makes way.
+                if self.challenges.len() >= COOKIE_QUEUE && self.challenges.pop_front().is_some() {
+                    LoopStats::count(&self.stats.cookie_reply_drops);
+                }
+                self.challenges.push_back(challenge);
+                return true;
+            }
+            Triage::Refused => return true,
+        }
         let got = match self.tunn.decapsulate_in_place_at(
             now,
             src,
@@ -954,6 +1169,99 @@ impl AsyncTunn {
             Got::Nothing => {}
         }
         true
+    }
+
+    /// Is there handshake work waiting?
+    fn has_deferred(&self) -> bool {
+        !self.handshakes.is_empty() || !self.challenges.is_empty()
+    }
+
+    /// Do what was put off, for as long as its allowance lasts: queued
+    /// handshake messages first — they have passed every check there is
+    /// short of the handshake itself — then the cookie replies that are
+    /// owed.
+    ///
+    /// `room` is how far short of a full batch the last look at the
+    /// socket was. The allowance is that part of a [`DEFERRED_SLICE`]
+    /// ([`Allowance::refill`]) whenever the socket was read empty. With no
+    /// room — the socket is backed up — the allowance is what receiving
+    /// has earned ([`Allowance::earn`]), and an item that took more than
+    /// there was leaves a debt that receiving has to make up before the
+    /// next one: a flood gets its replies, and traffic keeps two thirds
+    /// of the loop.
+    ///
+    /// Nothing is done while datagrams are waiting for the socket to
+    /// have room: an answer made now would only wait behind them.
+    fn serve_deferred(&mut self, now: Ticks, slabs: &mut Slabs, room: usize) {
+        if room > 0 {
+            self.deferred.refill(room);
+        }
+        while self.deferred.open() && self.outbox.is_empty() {
+            let started = std::time::Instant::now();
+            if let Some((mut datagram, src)) = self.handshakes.pop_front() {
+                let answer = match self.tunn.deferred_handshake_at(
+                    now,
+                    src,
+                    &mut datagram,
+                    slabs.net_out.spare_mut(),
+                ) {
+                    TunnResult::WriteToNetwork(datagram, to) => Some((datagram.len(), to)),
+                    // Rejected by the tunnel, or a response of the peer's
+                    // that completed a handshake of ours: nothing to send
+                    // (the flush at the top of the loop sends what a new
+                    // session calls for).
+                    _ => None,
+                };
+                if let Some((len, to)) = answer {
+                    let _ = self.transmit(&mut slabs.net_out, len, to);
+                }
+            } else if let Some(challenge) = self.challenges.pop_front() {
+                let reply =
+                    match self
+                        .tunn
+                        .cookie_reply_at(now, &challenge, slabs.net_out.spare_mut())
+                    {
+                        TunnResult::WriteToNetwork(datagram, to) => Some((datagram.len(), to)),
+                        // The cap on cookie replies, or a local fault (the
+                        // entropy source): this one is not made.
+                        _ => None,
+                    };
+                match reply {
+                    Some((len, to)) => {
+                        if !self.transmit_or_drop(&mut slabs.net_out, len, to) {
+                            // The socket has no room. It is not to be
+                            // kept for answers to strangers: what else is
+                            // owed them is let go as well. (Their senders
+                            // ask again in five seconds.)
+                            for _ in self.challenges.drain(..) {
+                                LoopStats::count(&self.stats.cookie_reply_drops);
+                            }
+                        }
+                    }
+                    None => LoopStats::count(&self.stats.cookie_reply_drops),
+                }
+            } else {
+                break;
+            }
+            self.deferred.spend(started.elapsed());
+        }
+    }
+
+    /// Put a cookie reply on the wire if the socket takes it now, and
+    /// drop it (and count it) if not: it is an answer to someone who has
+    /// proven nothing, and is not set aside ahead of the tunnel's own
+    /// datagrams. Returns whether the socket had room.
+    fn transmit_or_drop(&mut self, slab: &mut PooledBuf, len: usize, to: SocketAddr) -> bool {
+        slab.set_len(len);
+        let wire = if self.outbox.is_empty() {
+            self.send(slab, to)
+        } else {
+            Wire::Full
+        };
+        if wire != Wire::Sent {
+            LoopStats::count(&self.stats.cookie_reply_drops);
+        }
+        wire != Wire::Full
     }
 
     /// One packet from the TUN side. Returns `false` when the socket had
@@ -2028,17 +2336,211 @@ mod tests {
         assert!(!rig.task.is_finished());
     }
 
-    /// Answers to what arrives while the socket is full are kept as well
-    /// — sixteen datagrams in all — and beyond that they are dropped, and
-    /// counted.
+    /// While the socket is backed up, handshake work gets a third of the
+    /// loop and no more — however long its items take; while it is being
+    /// read empty, a quarter of a millisecond at a stretch, or the part
+    /// of that the last batch left room for.
+    #[test]
+    fn handshake_work_gets_a_third_of_a_backed_up_loop() {
+        let us = Duration::from_micros;
+        // Every turn receives for 40 µs and finds more waiting; every
+        // item of handshake work takes `item`. The share that goes to the
+        // items, over ten thousand turns:
+        for item in [us(3), us(34), us(125), us(900)] {
+            let mut allowance = Allowance::default();
+            let (mut receiving, mut handshakes) = (Duration::ZERO, Duration::ZERO);
+            for _ in 0..10_000 {
+                allowance.earn(us(40));
+                receiving += us(40);
+                while allowance.open() {
+                    allowance.spend(item);
+                    handshakes += item;
+                }
+            }
+            let share = handshakes.as_secs_f64() / (handshakes + receiving).as_secs_f64();
+            assert!((0.32..=0.35).contains(&share), "{item:?}: {share:.3}");
+        }
+        // What is earned does not pile up beyond a slice: after a long
+        // stretch of receiving with nothing owed, a stretch of handshake
+        // work is as long as after a short one.
+        let mut allowance = Allowance::default();
+        for _ in 0..1_000_000 {
+            allowance.earn(us(40));
+        }
+        let mut stretch = Duration::ZERO;
+        while allowance.open() {
+            allowance.spend(us(10));
+            stretch += us(10);
+        }
+        assert_eq!(stretch, DEFERRED_SLICE);
+        // An item that overdraws leaves a debt, and receiving pays it off
+        // before the next: 900 µs against an allowance of one takes
+        // forty-five turns of 40 µs to make up for.
+        let mut allowance = Allowance::default();
+        allowance.earn(us(2));
+        assert!(allowance.open());
+        allowance.spend(us(900));
+        let mut turns = 0;
+        while !allowance.open() {
+            allowance.earn(us(40));
+            turns += 1;
+        }
+        assert_eq!(turns, 45);
+        // A socket read empty: a slice, whatever was owed.
+        allowance.spend(Duration::from_secs(3600));
+        assert!(!allowance.open());
+        allowance.refill(BATCH);
+        let mut stretch = Duration::ZERO;
+        while allowance.open() {
+            allowance.spend(us(125));
+            stretch += us(125);
+        }
+        assert_eq!(stretch, us(250));
+        // One that held something when it was read empty: the less room
+        // there was in the batch, the shorter the stretch — and never
+        // none at all.
+        for (room, expected) in [
+            (BATCH, 250_000),
+            (BATCH / 2, 125_000),
+            (4, 31_250),
+            (1, 7_812),
+        ] {
+            let mut allowance = Allowance::default();
+            allowance.spend(us(900));
+            allowance.refill(room);
+            assert_eq!(allowance.0, expected, "room {room}");
+        }
+        let mut allowance = Allowance::default();
+        allowance.refill(0);
+        assert!(allowance.open());
+        // What was earned while the socket was backed up is not taken
+        // away by a look that found it nearly full.
+        let mut allowance = Allowance::default();
+        allowance.earn(us(400));
+        allowance.refill(1);
+        assert_eq!(allowance.0, 200_000);
+    }
+
+    /// What is put off is bounded, and what is kept is the newest: of
+    /// forty handshake messages that pass the cheap checks thirty-two
+    /// wait, of three hundred that are owed a cookie reply 256 — and the
+    /// replies go out in the order they were asked for.
+    #[tokio::test]
+    async fn what_is_put_off_is_bounded_and_the_oldest_makes_way() {
+        let socket_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = socket_a.local_addr().unwrap();
+        let socket_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_b = socket_b.local_addr().unwrap();
+        let (b_sk, b_pk) = keypair();
+        let (_, a_pk) = keypair();
+        // Not under load until this test says so: a second of handshake
+        // work at once is more than it does.
+        let limiter = Arc::new(
+            crate::RateLimiter::with_budget(Duration::from_secs(1))
+                .with_burst(Duration::from_secs(1)),
+        );
+        let tunn_b = Tunn::new(b_sk, a_pk, None, None, None, Some(limiter.clone())).unwrap();
+        let (mut driver, _channels, _rx, from_net) = AsyncTunn::channels(tunn_b, socket_b, 8);
+        let stats = driver.loop_stats();
+        let mut slabs = Slabs {
+            net_out: driver.pool.get(),
+            rx: driver.pool.get(),
+        };
+        // No loop is running here to learn it from the reactor: the
+        // socket has room.
+        driver.socket.writable().await.unwrap();
+        // Handshake initiations from people who know B's public key, each
+        // with the index its answer would carry.
+        let strangers: Vec<(Vec<u8>, Vec<u8>)> = (0..340)
+            .map(|_| {
+                let (key, _) = keypair();
+                let mut stranger = Tunn::new(key, b_pk, None, None, Some(addr_b), None).unwrap();
+                let mut buf = [0u8; 256];
+                match stranger.format_handshake_initiation(&mut buf) {
+                    TunnResult::WriteToNetwork(init, _) => (init.to_vec(), init[4..8].to_vec()),
+                    other => panic!("{other:?}"),
+                }
+            })
+            .collect();
+        let arrive = |driver: &mut AsyncTunn, slabs: &mut Slabs, datagram: &[u8]| {
+            slabs.rx.spare_mut()[..datagram.len()].copy_from_slice(datagram);
+            let now = driver.tunn.now();
+            assert!(driver.on_datagram(now, datagram.len(), addr_a, slabs, &from_net));
+        };
+        // One piece of what was put off, so that what it sends can be
+        // read back before the next.
+        let one = |driver: &mut AsyncTunn, slabs: &mut Slabs| {
+            driver.deferred = Allowance(1);
+            let now = driver.tunn.now();
+            driver.serve_deferred(now, slabs, 0);
+        };
+
+        // Not under load: forty arrive before any is dealt with.
+        for (init, _) in &strangers[..40] {
+            arrive(&mut driver, &mut slabs, init);
+        }
+        assert_eq!(driver.tunn.device_stats().initiations, 40);
+        assert_eq!(driver.handshakes.len(), HANDSHAKE_QUEUE);
+        assert_eq!(stats.handshake_drops(), 8);
+        let waiting: Vec<Vec<u8>> = driver
+            .handshakes
+            .iter()
+            .map(|(datagram, _)| datagram[4..8].to_vec())
+            .collect();
+        let newest: Vec<Vec<u8>> = strangers[8..40].iter().map(|(_, i)| i.clone()).collect();
+        assert_eq!(waiting, newest, "the eight oldest made way");
+        assert!(driver.challenges.is_empty() && driver.outbox.is_empty());
+        // Their turn, one at a time. None is B's peer, so none is
+        // answered.
+        for left in (0..HANDSHAKE_QUEUE).rev() {
+            assert!(driver.has_deferred());
+            one(&mut driver, &mut slabs);
+            assert_eq!(driver.handshakes.len(), left);
+        }
+        assert!(!driver.has_deferred() && driver.outbox.is_empty());
+        assert_eq!(stats.handshake_drops(), 8, "no more were lost");
+        assert!(!limiter.is_under_load());
+
+        // Under load: three hundred more. Each is owed a cookie reply, and
+        // 256 of those can wait.
+        limiter.note_handshake_time(Duration::from_secs(5));
+        assert!(limiter.is_under_load());
+        for (init, _) in &strangers[40..] {
+            arrive(&mut driver, &mut slabs, init);
+        }
+        assert!(driver.handshakes.is_empty());
+        assert_eq!(driver.challenges.len(), COOKIE_QUEUE);
+        assert_eq!(stats.cookie_reply_drops(), 300 - 256);
+        assert_eq!(driver.tunn.device_stats().cookies_required, 300);
+        assert_eq!(driver.tunn.device_stats().cookies_sent, 0, "none made yet");
+        // The replies: to the newest 256, oldest first.
+        let mut wire = [0u8; 128];
+        for (_, index) in &strangers[340 - 256..] {
+            one(&mut driver, &mut slabs);
+            let (n, from) = tokio::time::timeout(WAIT, socket_a.recv_from(&mut wire))
+                .await
+                .expect("a cookie reply")
+                .unwrap();
+            assert_eq!((wire[0], n, from), (3, 64, addr_b));
+            assert_eq!(wire[4..8], index[..]);
+        }
+        assert!(!driver.has_deferred());
+        assert_eq!(driver.tunn.device_stats().cookies_sent, 256);
+        assert_eq!(stats.cookie_reply_drops(), 300 - 256, "no more were lost");
+        assert_eq!(stats.egress_drops(), 0);
+    }
+
+    /// Cookie replies are owed to people who have proven nothing. While
+    /// the socket has no room they are not kept for it — nothing of
+    /// theirs is set aside ahead of the tunnel's own datagrams — but
+    /// dropped, and counted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn answers_a_full_socket_cannot_be_given_are_counted() {
         let socket_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket_b = connected_to(socket_a.local_addr().unwrap());
         let addr_b = socket_b.local_addr().unwrap();
-        // B is under load from its first handshake message on (for as
-        // long as each of the limiter's windows lasts): what follows is
-        // answered with cookie replies.
+        // B is under load from its first handshake message on: what
+        // follows is owed a cookie reply.
         let loaded = Arc::new(crate::RateLimiter::with_budget(Duration::from_nanos(1)));
         let mut rig = by_hand_and_loop_with(socket_b, socket_a, 8, Some(loaded)).await;
         let b_pub = rig.a.tunn.core().peer_public();
@@ -2049,57 +2551,47 @@ mod tests {
         rig.script.fail_sends(io::ErrorKind::WouldBlock, 1_000_000);
         // Forty handshake initiations from people who know B's public
         // key (sent from A's address: B's socket is connected to it).
-        // Each names the session index its answer is to carry.
-        let mut asked = Vec::new();
-        for _ in 0..40 {
+        let stranger_asks = |rig: &Rig| {
             let (key, _) = keypair();
             let mut stranger = Tunn::new(key, b_pub, None, None, Some(addr_b), None).unwrap();
             let mut buf = [0u8; 256];
             match stranger.format_handshake_initiation(&mut buf) {
                 TunnResult::WriteToNetwork(init, _) => {
-                    asked.push(init[4..8].to_vec());
-                    rig.a.socket.send_to(init, addr_b).await.unwrap();
+                    let index = init[4..8].to_vec();
+                    rig.a.socket.try_send_to(init, addr_b).unwrap();
+                    index
                 }
                 other => panic!("{other:?}"),
             }
+        };
+        for _ in 0..40 {
+            let _ = stranger_asks(&rig);
         }
-        // (All but the first of each of the limiter's windows — one a
-        // second — are answered: thirty-eight at the least.)
-        wait_until("B has answered them", || {
-            stats.device_stats().cookies_required >= 38
+        // (All of them — or all but the first, if the handshake that set
+        // this up is more than the limiter's hold ago and that one found
+        // B not under load.)
+        wait_until("B has seen them", || {
+            stats.device_stats().cookies_required >= 39
+        })
+        .await;
+        wait_until("…and has let every reply go", || {
+            stats.cookie_reply_drops() >= stats.device_stats().cookies_required
         })
         .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let answers = stats.device_stats().cookies_sent;
-        assert!((38..=40).contains(&answers), "{answers}");
-        // Sixteen are kept; the rest could not be.
-        assert_eq!(stats.egress_drops(), answers - 16);
+        let owed = stats.device_stats().cookies_required;
+        assert!((39..=40).contains(&owed), "{owed}");
+        assert_eq!(stats.cookie_reply_drops(), owed);
+        // Not one of them was set aside, and none was made twice: a reply
+        // is built only to find out that the socket has no room, and then
+        // the rest of what is owed is let go unbuilt.
+        assert_eq!(stats.egress_drops(), 0);
+        let built = stats.device_stats().cookies_sent;
+        assert!((1..=owed).contains(&built), "{built}");
 
-        // Room again: the sixteen go out, and nothing else does.
+        // Room again: nothing that was owed goes out late…
         rig.script.clear();
         let mut wire = [0u8; 256];
-        let mut answered = Vec::new();
-        for _ in 0..16 {
-            let (n, from) = tokio::time::timeout(WAIT, rig.a.socket.recv_from(&mut wire))
-                .await
-                .expect("a kept answer was not sent")
-                .unwrap();
-            assert_eq!((wire[0], n, from), (3, 64, addr_b));
-            answered.push(wire[4..8].to_vec());
-        }
-        // They are the answers to the first sixteen that got one, each
-        // once, in the order they were asked for.
-        let places: Vec<usize> = answered
-            .iter()
-            .map(|index| {
-                asked
-                    .iter()
-                    .position(|a| a == index)
-                    .expect("an answer to nobody")
-            })
-            .collect();
-        assert!(places.windows(2).all(|w| w[0] < w[1]), "{places:?}");
-        assert!(places[15] <= 17, "{places:?}");
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(200),
@@ -2108,6 +2600,15 @@ mod tests {
             .await
             .is_err()
         );
+        // …and the next one to ask is answered.
+        let index = stranger_asks(&rig);
+        let (n, from) = tokio::time::timeout(WAIT, rig.a.socket.recv_from(&mut wire))
+            .await
+            .expect("a cookie reply, now that there is room")
+            .unwrap();
+        assert_eq!((wire[0], n, from), (3, 64, addr_b));
+        assert_eq!(wire[4..8], index[..]);
+        assert_eq!(stats.cookie_reply_drops(), owed);
         // And the tunnel is as it was.
         rig.a.send(9).await;
         assert_eq!(recv(&mut rig.b.from_net).await[59], 9);
