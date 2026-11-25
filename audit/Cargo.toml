@@ -1,0 +1,78 @@
+# What an adversarial review of this repository measured and compared,
+# kept so that it can be run again:
+#
+#   tests/crypto_differential.rs   every in-tree primitive against an
+#                                  independent implementation (RustCrypto,
+#                                  dalek, siphasher) and the Wycheproof
+#                                  vectors
+#   src/bin/attack_cost.rs         what each kind of datagram costs its
+#                                  receiver, one scenario per run, for
+#                                  hardware counters (scripts/perf_attack_cost.sh)
+#   src/bin/many_peers.rs          the receive path when the tunnels do
+#                                  not fit the cache (scripts/perf_many_peers.sh)
+#   src/bin/flood.rs               a victim, its peer and an attacker for
+#                                  the tokio event loop, as three
+#                                  processes (scripts/flood_rig.sh)
+#   src/bin/lock_scaling.rs        one Device on several threads, by
+#                                  reference or behind a lock, next to
+#                                  threads that feed it junk
+#   src/bin/udp_stack_cost.rs      what a datagram costs the kernel, one
+#                                  call each, many per call, or as a
+#                                  train of segments
+#   examples/crypto_speed.rs       the primitives next to the reference
+#                                  implementations' speed
+#
+# See README.md here for how to run them and what they showed.
+[package]
+name = "wireguard-audit"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Adversarial measurements and differential tests for wireguard-sans-io and wireguard-embed"
+
+# A workspace of its own (excluded from the parent), like `bench/` and
+# `fuzz/`: the reference implementations it compares against come from
+# the registry, and the library's own builds and tests must not depend
+# on being able to fetch anything.
+[workspace]
+members = ["."]
+
+[dependencies]
+wireguard-sans-io = { path = ".." }
+wireguard-embed = { path = "../embed", features = ["async"] }
+wireguard-chacha-simd = { path = "../simd" }
+tokio = { version = "1.32", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
+
+# `udp_stack_cost` calls the C library itself: `recvmmsg` and the two
+# segmentation socket options have no safe wrapper among the crates the
+# driver uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# The implementations the in-tree primitives are compared with.
+chacha20poly1305 = "0.10"
+chacha20 = "0.9"
+poly1305 = "0.8"
+blake2 = "0.10"
+hmac = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+siphasher = "1"
+# Project Wycheproof's test vectors.
+wycheproof = "0.6"
+
+# The differential tests run a few hundred thousand cases; unoptimised
+# they take minutes.
+[profile.dev]
+opt-level = 2
+
+# The release profile of the repository's workspace, with symbols:
+# `perf report` is of little use without them.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = true
+strip = "none"
+
+[lints.rust]
+warnings = "deny"
