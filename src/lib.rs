@@ -99,7 +99,9 @@ mod tunnel;
 
 pub use crypto::chacha20::{ChaChaImpl, Scalar};
 pub use crypto::{CryptoProvider, InTree};
-pub use device::{CookieChallenge, Device, DeviceStats, Incoming, Initiation, PeerPacket};
+pub use device::{
+    CookieChallenge, CookieState, Device, DeviceStats, Incoming, Initiation, PeerPacket,
+};
 pub use entropy::{EntropyError, EntropySource};
 pub use error::{DropReason, Error};
 pub use index::PeerId;

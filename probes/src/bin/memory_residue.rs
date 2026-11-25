@@ -28,7 +28,9 @@
 //! states in which there is most to forget: a tunnel dropped with an
 //! initiation in flight; a tunnel that is reset, and one that is dropped,
 //! while it holds a cookie; a device dropped after it has minted cookies
-//! under two secrets.
+//! under two secrets; and a `CookieState` — the cookie secrets of a device
+//! that several threads receive on, which its caller keeps — dropped
+//! after the same.
 //!
 //! Exit status: 0 if all of that holds, 1 if not, 2 if the probe itself
 //! does not work (it must see the transport keys while a session is live,
@@ -43,8 +45,8 @@ use std::sync::Mutex;
 use wireguard_probes::{Found, Needle, Needles, Recorded, bytes_of};
 use wireguard_sans_io::crypto::{aead, blake2s, x25519};
 use wireguard_sans_io::{
-    CryptoProvider, Device, Encapsulated, Error, InTree, Incoming, PeerConfig, PeerId, PollOutput,
-    PresharedKey, Received, StaticSecret, Ticks, Tunnel, WallClock,
+    CookieState, CryptoProvider, Device, DeviceStats, Encapsulated, Error, InTree, Incoming,
+    PeerConfig, PeerId, PollOutput, PresharedKey, Received, StaticSecret, Ticks, Tunnel, WallClock,
 };
 
 /// What a recorded secret was seen as.
@@ -850,6 +852,75 @@ fn endings(probe: &mut Probe) {
             current
         },
     ) && holds.len() >= 3;
+
+    // ---- cookie secrets kept outside the device (`CookieState`) ---------------------
+    // The shared calls take them from a state of the caller's. The same
+    // two rounds through those calls, a secret each: they are in that
+    // state while it lives, never in the device, and nowhere once the
+    // state has been dropped.
+    let mut state = Slot::new(CookieState::new());
+    let mut stats = DeviceStats::default();
+    let mut kept = Needles::default();
+    for (round, now) in [at(500), at(700)].into_iter().enumerate() {
+        y.tunnel.get().request_handshake(now);
+        let (sent, _) = poll_all(&mut y, now, &mut rng);
+        let mut datagram = sent.first().expect("an initiation").clone();
+        let mut out = [0u8; 64];
+        let before = rng.log.len();
+        let device: &Device<Recording> = x.device.get();
+        match device.receive_shared(Some(&*state.get()), now, y_addr, &mut datagram, &mut stats) {
+            Incoming::CookieRequired(challenge) => {
+                device
+                    .cookie_reply_shared(
+                        state.get(),
+                        now,
+                        &challenge,
+                        &mut out,
+                        &mut rng,
+                        &mut stats,
+                    )
+                    .unwrap();
+            }
+            other => panic!("expected a cookie to be required, got {other:?}"),
+        }
+        for drawn in rng.log[before..].iter().filter(|d| d.len() == 32) {
+            kept.add(
+                &format!("cookie secret no. {} of the caller's state", round + 1),
+                drawn,
+            );
+        }
+        y.tunnel.get().reset();
+    }
+    assert_eq!(kept.0.len(), 2, "two cookie secrets were drawn");
+    probe.saw_device_secrets &= probe.check_present(
+        "a cookie state that has minted cookies holds its current secret",
+        &state.bytes(),
+        &{
+            let mut current = Needles::default();
+            current.add(
+                "cookie secret no. 2 of the caller's state",
+                &kept.0[1].bytes,
+            );
+            current
+        },
+    );
+    let in_device: Vec<String> = kept
+        .found_in(&x.device.bytes())
+        .iter()
+        .map(|(needle, _)| format!("{} is in the device", needle.name))
+        .collect();
+    probe.result(
+        "and the device it was used with holds none of them",
+        &in_device,
+    );
+    state.drop_in_place();
+    probe.check_gone(
+        "after that cookie state was dropped: nothing from the entropy source",
+        &state.bytes(),
+        &rng.log,
+        &kept,
+    );
+
     x.device.drop_in_place();
     probe.check("after that device was dropped", &x.device.bytes(), &nothing);
     probe.check_gone(
