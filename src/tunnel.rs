@@ -670,7 +670,7 @@ pub struct Tunnel<P: CryptoProvider = InTree> {
     precomputed_ss: StaticStaticSecret,
     wall_clock: WallClock,
     indices: IndexAllocator,
-    _provider: PhantomData<P>,
+    _provider: PhantomData<fn() -> P>,
 }
 
 impl<P: CryptoProvider> core::fmt::Debug for Tunnel<P> {

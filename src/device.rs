@@ -27,6 +27,24 @@
 //! the caller a place to decide, per source address, whether to spend it
 //! (see [`Initiation::source_verified`]), and lets several of them run at
 //! once.
+//!
+//! # One device, several threads
+//!
+//! Everything a device needs to *route* is fixed when it is made: its
+//! keys. What changes while it receives is small — its counters, and the
+//! cookie secret, which is only looked at while under load. So there are
+//! two ways to call it:
+//!
+//! * [`Device::receive`] and [`Device::cookie_reply`] take `&mut self`
+//!   and keep both inside the device. One thread, nothing to arrange.
+//! * [`Device::receive_shared`] and [`Device::cookie_reply_shared`] take
+//!   `&self`, and are handed what changes: counters of the caller's (one
+//!   set per thread) and a [`CookieState`]. The device itself is then
+//!   shared by plain reference — an `Arc<Device>`, no lock — and so is
+//!   [`Device::identify`]: no datagram of any peer ever waits for another
+//!   thread's handshake arithmetic. Only the `CookieState` needs a lock
+//!   of its own, and only handshake messages that arrive under load ask
+//!   for it.
 
 use core::marker::PhantomData;
 use core::net::SocketAddr;
@@ -319,6 +337,116 @@ impl DeviceStats {
         cookies_sent: 0,
         routed: 0,
     };
+
+    /// Add `other`'s counts to these. For a device that several threads
+    /// share ([`Device::receive_shared`]): each thread counts for itself,
+    /// and whoever wants the totals adds them up.
+    pub fn merge(&mut self, other: &Self) {
+        self.malformed = self.malformed.saturating_add(other.malformed);
+        self.mac1_failures = self.mac1_failures.saturating_add(other.mac1_failures);
+        self.initiations = self.initiations.saturating_add(other.initiations);
+        self.cookies_required = self.cookies_required.saturating_add(other.cookies_required);
+        self.cookies_sent = self.cookies_sent.saturating_add(other.cookies_sent);
+        self.routed = self.routed.saturating_add(other.routed);
+    }
+}
+
+/// The cookie secret of one [`Device`] and the clock it ages by: the one
+/// part of receiving that changes from datagram to datagram.
+///
+/// A device has one of its own, which [`Device::receive`] and
+/// [`Device::cookie_reply`] use — that is why those two take `&mut self`.
+/// A device that several threads share is called through
+/// [`Device::receive_shared`] and [`Device::cookie_reply_shared`]
+/// instead: they take `&self` and are handed the cookie state. Keep one
+/// `CookieState` next to such a device, behind a lock of its own. It is
+/// asked for only while under load — shared, to check a cookie;
+/// exclusively, to make a cookie reply — so transport data never waits
+/// for it, and nothing at all waits for [`Device::identify`].
+///
+/// A cookie is good only for the state that made it. Use one state with a
+/// device: not this one and the device's own in turn, and not one per
+/// thread (a cookie handed out by one thread would be refused by the
+/// next).
+///
+/// Holds the cookie secrets; they are wiped when it is dropped.
+pub struct CookieState {
+    jar: CookieJar,
+    /// The latest instant seen (cookies age by this clock): time never
+    /// goes backwards here either, nor out of range.
+    last_now: Ticks,
+}
+
+impl CookieState {
+    /// A state without a secret: one is drawn when the first cookie reply
+    /// is made.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            jar: CookieJar::new(),
+            last_now: Ticks::ZERO,
+        }
+    }
+
+    /// Time as this state counts it — see [`Ticks::MAX`] — moving its
+    /// clock on.
+    fn clamp_now(&mut self, now: Ticks) -> Ticks {
+        self.last_now = now.following(self.last_now);
+        self.last_now
+    }
+
+    /// The same for a state that is shared, whose clock is read and not
+    /// moved: an instant before the last one the state was moved to — or
+    /// out of range — counts as that one. (The clock is moved whenever a
+    /// cookie reply is made, which is also the only time a secret is
+    /// drawn: no instant read here is ever before the secret it is
+    /// compared with.)
+    fn seen(&self, now: Ticks) -> Ticks {
+        now.following(self.last_now)
+    }
+
+    /// Does `mac2` show a cookie of ours for `src`, at `now` as this
+    /// state counts it?
+    fn accepts<P: CryptoProvider>(
+        &self,
+        now: Ticks,
+        src: SocketAddr,
+        beta: &[u8],
+        mac2: &[u8; 16],
+    ) -> bool {
+        self.jar
+            .verify_mac2::<P>(now, RemoteBytes::new(src).as_slice(), beta, mac2)
+    }
+}
+
+impl Default for CookieState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::fmt::Debug for CookieState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CookieState")
+    }
+}
+
+/// Whether handshake messages have to carry a cookie, and the state to
+/// check it against.
+enum Load<'c> {
+    /// Not under load: `mac1` is all a handshake message needs.
+    Light,
+    /// Under load, with a cookie state that is shared: its clock is read.
+    Shared(&'c CookieState),
+    /// Under load, with a cookie state that is the caller's alone: its
+    /// clock moves on.
+    Exclusive(&'c mut CookieState),
+}
+
+impl Load<'_> {
+    fn under_load(&self) -> bool {
+        !matches!(self, Self::Light)
+    }
 }
 
 /// The local identity and everything its peers share.
@@ -408,14 +536,17 @@ pub struct Device<P: CryptoProvider = InTree> {
     local_public: PublicKey,
     constants: HandshakeConstants,
     mac_keys: DeviceMacKeys,
-    jar: CookieJar,
     codec: IndexCodec,
     wall_clock: WallClock,
-    /// The latest instant seen (cookies age by this clock): time never
-    /// goes backwards for the device either, nor out of range.
-    last_now: Ticks,
+    /// What [`Device::receive`] and [`Device::cookie_reply`] change: the
+    /// cookie secret and the counters. (The calls for a shared device are
+    /// handed theirs.) Nothing else in a device changes once it is made,
+    /// short of [`Device::set_wall_clock`].
+    cookies: CookieState,
     stats: DeviceStats,
-    _provider: PhantomData<P>,
+    /// (`fn() -> P`: a provider is a type that is never made, and says
+    /// nothing about whether a device may be shared between threads.)
+    _provider: PhantomData<fn() -> P>,
 }
 
 impl<P: CryptoProvider> core::fmt::Debug for Device<P> {
@@ -468,10 +599,9 @@ impl<P: CryptoProvider> Device<P> {
         local_public: PublicKey::from_bytes([0u8; 32]),
         constants: HandshakeConstants::BLANK,
         mac_keys: DeviceMacKeys::BLANK,
-        jar: CookieJar::new(),
         codec: IndexCodec::BLANK,
         wall_clock: WallClock::new(Ticks::ZERO, 0, 0),
-        last_now: Ticks::ZERO,
+        cookies: CookieState::new(),
         stats: DeviceStats::ZERO,
         _provider: PhantomData,
     };
@@ -704,11 +834,98 @@ impl<P: CryptoProvider> Device<P> {
         under_load: bool,
         datagram: &'d mut [u8],
     ) -> Incoming<'d> {
-        match self.classify(now, src, under_load, datagram) {
+        let load = if under_load {
+            Load::Exclusive(&mut self.cookies)
+        } else {
+            Load::Light
+        };
+        let classified = Self::classify(&self.mac_keys, load, &mut self.stats, now, src, datagram);
+        Self::route(&self.codec, &mut self.stats, classified)
+    }
+
+    /// [`Device::receive`] for a device that is shared: `&self`, with what
+    /// changes handed in.
+    ///
+    /// * `cookies` is the load signal and the cookie state in one: `None`
+    ///   while not under load; under load, the [`CookieState`] handshake
+    ///   messages are checked against (the one
+    ///   [`Device::cookie_reply_shared`] makes its replies with).
+    /// * `stats` is where this call counts: a [`DeviceStats`] of the
+    ///   caller's — one per thread, added up with [`DeviceStats::merge`]
+    ///   when someone asks. [`Device::stats`] does not see it.
+    ///
+    /// Everything else is as in [`Device::receive`]: the same checks at
+    /// the same cost, the same [`Incoming`]. What differs is who may call
+    /// it when. Nothing in the device is written, so any number of
+    /// threads receive at once — and next to [`Device::identify`], which
+    /// takes `&self` as well: the one X25519 an initiation costs before
+    /// its peer is known never stands between another datagram and its
+    /// tunnel. (With `&mut self` it does, whatever the lock: a
+    /// reader-writer lock held *shared* across `identify` keeps every
+    /// writer out for as long, and `Device::receive` is a writer.)
+    ///
+    /// ```
+    /// use std::sync::RwLock;
+    /// use wireguard_sans_io::testing::DeterministicRng;
+    /// use wireguard_sans_io::{CookieState, Device, DeviceStats, Incoming, StaticSecret, Ticks, WallClock};
+    ///
+    /// let mut rng = DeterministicRng::new(1); // ⚠ tests only
+    /// let key = StaticSecret::generate(&mut rng)?;
+    /// let device = Device::new(key, WallClock::new(Ticks::ZERO, 1_700_000_000, 0), &mut rng)?;
+    /// // Shared by reference; the cookie state alone is behind a lock.
+    /// let cookies = RwLock::new(CookieState::new());
+    /// let under_load = || false; // your load signal
+    ///
+    /// std::thread::scope(|threads| {
+    ///     for _ in 0..2 {
+    ///         threads.spawn(|| {
+    ///             let mut stats = DeviceStats::default(); // this thread's
+    ///             let mut datagram = [0u8; 64]; // …from this thread's socket
+    ///             let src = "192.0.2.7:51820".parse().unwrap();
+    ///             // The lock is taken only while under load, and shared.
+    ///             let guard = under_load().then(|| cookies.read().unwrap());
+    ///             match device.receive_shared(guard.as_deref(), Ticks::ZERO, src, &mut datagram, &mut stats) {
+    ///                 Incoming::ForPeer(_id, _packet) => { /* the peer's tunnel, under its own lock */ }
+    ///                 Incoming::Initiation(mut init) => { let _ = device.identify(&mut init); }
+    ///                 Incoming::CookieRequired(_challenge) => {
+    ///                     // drop(guard); cookies.write() … device.cookie_reply_shared(…)
+    ///                 }
+    ///                 _ => {}
+    ///             }
+    ///             assert_eq!(stats.malformed, 1);
+    ///         });
+    ///     }
+    /// });
+    /// # Ok::<(), wireguard_sans_io::Error>(())
+    /// ```
+    pub fn receive_shared<'d>(
+        &self,
+        cookies: Option<&CookieState>,
+        now: Ticks,
+        src: SocketAddr,
+        datagram: &'d mut [u8],
+        stats: &mut DeviceStats,
+    ) -> Incoming<'d> {
+        let load = match cookies {
+            Some(cookies) => Load::Shared(cookies),
+            None => Load::Light,
+        };
+        let classified = Self::classify(&self.mac_keys, load, stats, now, src, datagram);
+        Self::route(&self.codec, stats, classified)
+    }
+
+    /// The last step of receiving: the receiver index, if there is one,
+    /// decoded into a peer id.
+    fn route<'d>(
+        codec: &IndexCodec,
+        stats: &mut DeviceStats,
+        classified: Classified<'d>,
+    ) -> Incoming<'d> {
+        match classified {
             Classified::Initiation(initiation) => Incoming::Initiation(initiation),
             Classified::Indexed(receiver_index, packet) => {
-                self.stats.routed = self.stats.routed.saturating_add(1);
-                Incoming::ForPeer(self.codec.decode(receiver_index), packet)
+                stats.routed = stats.routed.saturating_add(1);
+                Incoming::ForPeer(codec.decode(receiver_index), packet)
             }
             Classified::CookieRequired(challenge) => Incoming::CookieRequired(challenge),
             Classified::Dropped(reason) => Incoming::Dropped(reason),
@@ -716,18 +933,22 @@ impl<P: CryptoProvider> Device<P> {
     }
 
     /// Everything [`receive`](Self::receive) does except decoding the
-    /// receiver index into a peer id.
+    /// receiver index into a peer id. It reads the `mac1` key, counts in
+    /// `stats`, and — under load — looks at the cookie state `load` came
+    /// with: nothing else of a device, which is what lets a shared one
+    /// be received on.
     fn classify<'d>(
-        &mut self,
+        mac_keys: &DeviceMacKeys,
+        load: Load<'_>,
+        stats: &mut DeviceStats,
         now: Ticks,
         src: SocketAddr,
-        under_load: bool,
         datagram: &'d mut [u8],
     ) -> Classified<'d> {
         let kind = match message::peek(datagram) {
             Ok(kind) => kind,
             Err(reason) => {
-                self.stats.malformed = self.stats.malformed.saturating_add(1);
+                stats.malformed = stats.malformed.saturating_add(1);
                 return Classified::Dropped(reason);
             }
         };
@@ -770,10 +991,14 @@ impl<P: CryptoProvider> Device<P> {
                 let Ok(Packet::HandshakeResponse(msg)) = message::parse(datagram) else {
                     return Classified::Dropped(DropReason::Malformed);
                 };
-                if let Some(rejected) = self.gate(
+                // The gate checks `mac2` exactly while under load.
+                let source_verified = load.under_load();
+                if let Some(rejected) = Self::gate(
+                    mac_keys,
+                    load,
+                    stats,
                     now,
                     src,
-                    under_load,
                     msg.alpha,
                     msg.beta,
                     msg.mac1,
@@ -786,8 +1011,7 @@ impl<P: CryptoProvider> Device<P> {
                     receiver_index,
                     PeerPacket {
                         kind: PeerPacketKind::Response(msg),
-                        // The gate checks `mac2` exactly while under load.
-                        source_verified: under_load,
+                        source_verified,
                     },
                 )
             }
@@ -796,10 +1020,14 @@ impl<P: CryptoProvider> Device<P> {
                 let Ok(Packet::HandshakeInitiation(msg)) = message::parse(datagram) else {
                     return Classified::Dropped(DropReason::Malformed);
                 };
-                if let Some(rejected) = self.gate(
+                // The gate checks `mac2` exactly while under load.
+                let source_verified = load.under_load();
+                if let Some(rejected) = Self::gate(
+                    mac_keys,
+                    load,
+                    stats,
                     now,
                     src,
-                    under_load,
                     msg.alpha,
                     msg.beta,
                     msg.mac1,
@@ -810,22 +1038,15 @@ impl<P: CryptoProvider> Device<P> {
                 }
                 // The cheap MACs passed. Everything expensive comes
                 // later, in `identify` and in the tunnel.
-                self.stats.initiations = self.stats.initiations.saturating_add(1);
+                stats.initiations = stats.initiations.saturating_add(1);
                 Classified::Initiation(Initiation {
                     msg,
                     src,
-                    // The gate checks `mac2` exactly while under load.
-                    source_verified: under_load,
+                    source_verified,
                     identity: Identity::blank(),
                 })
             }
         }
-    }
-
-    /// Time as the device counts it: see [`Ticks::MAX`].
-    fn clamp_now(&mut self, now: Ticks) -> Ticks {
-        self.last_now = now.following(self.last_now);
-        self.last_now
     }
 
     /// The checks every handshake message passes before anything
@@ -833,27 +1054,31 @@ impl<P: CryptoProvider> Device<P> {
     /// §5.3). `None` means "go on".
     #[allow(clippy::too_many_arguments)] // the fields of one handshake message
     fn gate(
-        &mut self,
+        mac_keys: &DeviceMacKeys,
+        load: Load<'_>,
+        stats: &mut DeviceStats,
         now: Ticks,
         src: SocketAddr,
-        under_load: bool,
         alpha: &[u8],
         beta: &[u8],
         mac1: &[u8; 16],
         mac2: &[u8; 16],
         sender_index: u32,
     ) -> Option<Classified<'static>> {
-        if !cookie::verify_mac1::<P>(&self.mac_keys, alpha, mac1) {
-            self.stats.mac1_failures = self.stats.mac1_failures.saturating_add(1);
+        if !cookie::verify_mac1::<P>(mac_keys, alpha, mac1) {
+            stats.mac1_failures = stats.mac1_failures.saturating_add(1);
             return Some(Classified::Dropped(DropReason::InvalidMac1));
         }
-        if under_load && {
-            let now = self.clamp_now(now);
-            !self
-                .jar
-                .verify_mac2::<P>(now, RemoteBytes::new(src).as_slice(), beta, mac2)
-        } {
-            self.stats.cookies_required = self.stats.cookies_required.saturating_add(1);
+        let proven = match load {
+            Load::Light => true,
+            Load::Shared(cookies) => cookies.accepts::<P>(cookies.seen(now), src, beta, mac2),
+            Load::Exclusive(cookies) => {
+                let now = cookies.clamp_now(now);
+                cookies.accepts::<P>(now, src, beta, mac2)
+            }
+        };
+        if !proven {
+            stats.cookies_required = stats.cookies_required.saturating_add(1);
             return Some(Classified::CookieRequired(CookieChallenge {
                 src,
                 sender_index,
@@ -871,11 +1096,12 @@ impl<P: CryptoProvider> Device<P> {
     ///
     /// This is the expensive step of receiving an initiation — **one
     /// X25519** — and the only one that happens before the peer is known.
-    /// It takes `&self`: it changes nothing in the device, so it can run
-    /// outside whatever lock protects [`Device::receive`], and several can
-    /// run at once. Anyone who knows our public key (and, under load, has
-    /// a cookie) can make us spend it; whether to is the caller's decision
-    /// — see [`Initiation::source_verified`].
+    /// It takes `&self`: it changes nothing in the device, so several can
+    /// run at once — and, on a device that is shared
+    /// ([`Device::receive_shared`]), at the same time as anything else.
+    /// Anyone who knows our public key (and, under load, has a cookie)
+    /// can make us spend it; whether to is the caller's decision — see
+    /// [`Initiation::source_verified`].
     ///
     /// Calling it again on the same initiation returns the same key
     /// without repeating the work.
@@ -912,10 +1138,55 @@ impl<P: CryptoProvider> Device<P> {
         out: &'o mut [u8],
         rng: &mut dyn EntropySource,
     ) -> Result<Transmit<'o>, Error> {
-        let now = self.clamp_now(now);
-        let len = cookie::build_cookie_reply::<P>(
+        Self::reply(
             &self.mac_keys,
-            &mut self.jar,
+            &mut self.cookies,
+            &mut self.stats,
+            now,
+            challenge,
+            out,
+            rng,
+        )
+    }
+
+    /// [`Device::cookie_reply`] for a device that is shared: `&self`,
+    /// with the [`CookieState`] to mint from — the one
+    /// [`Device::receive_shared`] checks cookies against — and the
+    /// [`DeviceStats`] to count in handed to it.
+    ///
+    /// This is the one call that needs the cookie state exclusively (the
+    /// secret is drawn here, and every reply takes a nonce), for the time
+    /// one reply takes to build. Whoever waits for it is a handshake
+    /// message that arrived under load; transport data is not among them.
+    ///
+    /// # Errors
+    /// As [`Device::cookie_reply`].
+    pub fn cookie_reply_shared<'o>(
+        &self,
+        cookies: &mut CookieState,
+        now: Ticks,
+        challenge: &CookieChallenge,
+        out: &'o mut [u8],
+        rng: &mut dyn EntropySource,
+        stats: &mut DeviceStats,
+    ) -> Result<Transmit<'o>, Error> {
+        Self::reply(&self.mac_keys, cookies, stats, now, challenge, out, rng)
+    }
+
+    /// A cookie reply from `cookies`, counted in `stats`.
+    fn reply<'o>(
+        mac_keys: &DeviceMacKeys,
+        cookies: &mut CookieState,
+        stats: &mut DeviceStats,
+        now: Ticks,
+        challenge: &CookieChallenge,
+        out: &'o mut [u8],
+        rng: &mut dyn EntropySource,
+    ) -> Result<Transmit<'o>, Error> {
+        let now = cookies.clamp_now(now);
+        let len = cookie::build_cookie_reply::<P>(
+            mac_keys,
+            &mut cookies.jar,
             now,
             rng,
             challenge.sender_index,
@@ -923,7 +1194,7 @@ impl<P: CryptoProvider> Device<P> {
             RemoteBytes::new(challenge.src).as_slice(),
             out,
         )?;
-        self.stats.cookies_sent = self.stats.cookies_sent.saturating_add(1);
+        stats.cookies_sent = stats.cookies_sent.saturating_add(1);
         let datagram = out.get(..len).ok_or(Error::Internal)?;
         Ok(Transmit {
             dst: challenge.src,
@@ -960,7 +1231,12 @@ impl<P: CryptoProvider> Device<P> {
         out: &'a mut [u8],
         rng: &mut dyn EntropySource,
     ) -> Result<Handled<'a>, Error> {
-        match self.classify(now, src, under_load, datagram) {
+        let load = if under_load {
+            Load::Exclusive(&mut self.cookies)
+        } else {
+            Load::Light
+        };
+        match Self::classify(&self.mac_keys, load, &mut self.stats, now, src, datagram) {
             // The tunnel identifies the initiation itself: with one peer
             // there is nobody to look up.
             Classified::Initiation(initiation) => {

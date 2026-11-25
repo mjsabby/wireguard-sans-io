@@ -114,10 +114,12 @@ fn	wireguard_sans_io::message	fn parse(datagram: &[u8]) -> Result<Packet<'_>,cra
 fn	wireguard_sans_io::message	fn peek(datagram: &[u8]) -> Result<PacketKind,crate::error::DropReason>
 fn	wireguard_sans_io::message	fn write_transport_header(out: &mut [u8], receiver_index: u32, counter: u64) -> Result<(),crate::error::Error>
 method	wireguard_sans_io	impl <P> Device<P> :: fn cookie_reply(self: &mut Self, now: Ticks, challenge: &CookieChallenge, out: &mut [u8], rng: &mut dyn EntropySource) -> Result<Transmit<'o>,Error>
+method	wireguard_sans_io	impl <P> Device<P> :: fn cookie_reply_shared(self: &Self, cookies: &mut CookieState, now: Ticks, challenge: &CookieChallenge, out: &mut [u8], rng: &mut dyn EntropySource, stats: &mut DeviceStats) -> Result<Transmit<'o>,Error>
 method	wireguard_sans_io	impl <P> Device<P> :: fn identify(self: &Self, initiation: &mut Initiation<'_>) -> Result<PublicKey,DropReason>
 method	wireguard_sans_io	impl <P> Device<P> :: fn public_key(self: &Self) -> PublicKey
 method	wireguard_sans_io	impl <P> Device<P> :: fn receive(self: &mut Self, now: Ticks, src: SocketAddr, under_load: bool, datagram: &mut [u8]) -> Incoming<'d>
 method	wireguard_sans_io	impl <P> Device<P> :: fn receive_for(self: &mut Self, tunnel: &mut Tunnel<P>, now: Ticks, src: SocketAddr, under_load: bool, datagram: &mut [u8], out: &mut [u8], rng: &mut dyn EntropySource) -> Result<Handled<'a>,Error>
+method	wireguard_sans_io	impl <P> Device<P> :: fn receive_shared(self: &Self, cookies: Option<&CookieState>, now: Ticks, src: SocketAddr, datagram: &mut [u8], stats: &mut DeviceStats) -> Incoming<'d>
 method	wireguard_sans_io	impl <P> Device<P> :: fn set_wall_clock(self: &mut Self, wall_clock: WallClock) -> ()
 method	wireguard_sans_io	impl <P> Device<P> :: fn stats(self: &Self) -> DeviceStats
 method	wireguard_sans_io	impl <P> Device<P> :: fn tunnel(self: &Self, id: PeerId, config: PeerConfig, rng: &mut dyn EntropySource) -> Result<Tunnel<P>,Error>
@@ -143,8 +145,10 @@ method	wireguard_sans_io	impl <P> Tunnel<P> :: fn set_wall_clock(self: &mut Self
 method	wireguard_sans_io	impl <P> Tunnel<P> :: fn stats(self: &Self) -> Stats
 method	wireguard_sans_io	impl <P> Tunnel<P> :: fn timer(self: &Self, timer: Timer) -> Option<Ticks>
 method	wireguard_sans_io	impl CookieChallenge :: fn src(self: &Self) -> SocketAddr
+method	wireguard_sans_io	impl CookieState :: const fn new() -> Self
 method	wireguard_sans_io	impl Device<crate::crypto::InTree> :: fn new(local_static: StaticSecret, wall_clock: WallClock, rng: &mut dyn EntropySource) -> Result<Self,Error>
 method	wireguard_sans_io	impl Device<crate::crypto::InTree> :: fn new_in(slot: &mut Option<Self>, local_static: &StaticSecret, wall_clock: WallClock, rng: &mut dyn EntropySource) -> Result<&mut Self,Error>
+method	wireguard_sans_io	impl DeviceStats :: fn merge(self: &mut Self, other: &Self) -> ()
 method	wireguard_sans_io	impl Initiation<'_> :: fn peer_public(self: &Self) -> Option<PublicKey>
 method	wireguard_sans_io	impl Initiation<'_> :: fn sender_index(self: &Self) -> u32
 method	wireguard_sans_io	impl Initiation<'_> :: fn source_verified(self: &Self) -> bool
@@ -199,6 +203,7 @@ method	wireguard_sans_io::replay	impl ReplayWindow :: fn greatest(self: &Self) -
 method	wireguard_sans_io::testing	impl DeterministicRng :: fn new(seed: u64) -> Self
 method	wireguard_sans_io::testing	impl DeterministicRng :: fn next_u64(self: &mut Self) -> u64
 struct	wireguard_sans_io	CookieChallenge
+struct	wireguard_sans_io	CookieState
 struct	wireguard_sans_io	Device
 struct	wireguard_sans_io	DeviceStats
 struct	wireguard_sans_io	EntropyError
@@ -280,6 +285,7 @@ trait_impl	wireguard_sans_io	impl Copy for Timer {} provided {}
 trait_impl	wireguard_sans_io	impl Copy for Transmit<'a> {} provided {}
 trait_impl	wireguard_sans_io	impl Copy for WallClock {} provided {}
 trait_impl	wireguard_sans_io	impl Debug for CookieChallenge {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Debug for CookieState {fmt} provided {}
 trait_impl	wireguard_sans_io	impl Debug for DeviceStats {fmt} provided {}
 trait_impl	wireguard_sans_io	impl Debug for DropReason {fmt} provided {}
 trait_impl	wireguard_sans_io	impl Debug for Encapsulated<'a> {fmt} provided {}
@@ -305,6 +311,7 @@ trait_impl	wireguard_sans_io	impl Debug for Ticks {fmt} provided {}
 trait_impl	wireguard_sans_io	impl Debug for Timer {fmt} provided {}
 trait_impl	wireguard_sans_io	impl Debug for Transmit<'_> {fmt} provided {}
 trait_impl	wireguard_sans_io	impl Debug for WallClock {fmt} provided {}
+trait_impl	wireguard_sans_io	impl Default for CookieState {default} provided {}
 trait_impl	wireguard_sans_io	impl Default for DeviceStats {default} provided {}
 trait_impl	wireguard_sans_io	impl Default for PresharedKey {default} provided {}
 trait_impl	wireguard_sans_io	impl Default for Scalar {default} provided {}

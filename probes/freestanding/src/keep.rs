@@ -7,7 +7,7 @@
 #![allow(clippy::all, clippy::pedantic)]
 use wireguard_sans_io as wg;
 
-/// 183 addresses.
+/// 187 addresses.
 pub fn keep_api<P: wg::CryptoProvider, C: wg::ChaChaImpl, H: core::hash::Hasher>() {
     macro_rules! k {
         ($e:expr) => {
@@ -93,10 +93,12 @@ pub fn keep_api<P: wg::CryptoProvider, C: wg::ChaChaImpl, H: core::hash::Hasher>
     k!(wg::message::peek);
     k!(wg::message::write_transport_header);
     k!(wg::Device::<P>::cookie_reply);
+    k!(wg::Device::<P>::cookie_reply_shared);
     k!(wg::Device::<P>::identify);
     k!(wg::Device::<P>::public_key);
     k!(wg::Device::<P>::receive);
     k!(wg::Device::<P>::receive_for);
+    k!(wg::Device::<P>::receive_shared);
     k!(wg::Device::<P>::set_wall_clock);
     k!(wg::Device::<P>::stats);
     k!(wg::Device::<P>::tunnel);
@@ -122,8 +124,10 @@ pub fn keep_api<P: wg::CryptoProvider, C: wg::ChaChaImpl, H: core::hash::Hasher>
     k!(wg::Tunnel::<P>::stats);
     k!(wg::Tunnel::<P>::timer);
     k!(wg::CookieChallenge::src);
+    k!(wg::CookieState::new);
     k!(wg::Device::<wg::InTree>::new);
     k!(wg::Device::<wg::InTree>::new_in);
+    k!(wg::DeviceStats::merge);
     k!(wg::Initiation::peer_public);
     k!(wg::Initiation::sender_index);
     k!(wg::Initiation::source_verified);
@@ -199,7 +203,7 @@ pub fn keep_api<P: wg::CryptoProvider, C: wg::ChaChaImpl, H: core::hash::Hasher>
     k!(<wg::testing::FailingRng as wg::EntropySource>::gen32);
 }
 
-/// 141 addresses.
+/// 142 addresses.
 pub fn keep_traits<P: wg::CryptoProvider, C: wg::ChaChaImpl, H: core::hash::Hasher>() {
     macro_rules! k {
         ($e:expr) => {
@@ -245,6 +249,7 @@ pub fn keep_traits<P: wg::CryptoProvider, C: wg::ChaChaImpl, H: core::hash::Hash
     k!(<wg::Transmit<'static> as core::clone::Clone>::clone_from);
     k!(<wg::WallClock as core::clone::Clone>::clone);
     k!(<wg::WallClock as core::clone::Clone>::clone_from);
+    k!(<wg::CookieState as core::default::Default>::default);
     k!(<wg::DeviceStats as core::default::Default>::default);
     k!(<wg::PresharedKey as core::default::Default>::default);
     k!(<wg::Scalar as core::default::Default>::default);
@@ -349,7 +354,7 @@ pub fn keep_traits<P: wg::CryptoProvider, C: wg::ChaChaImpl, H: core::hash::Hash
     k!(<wg::testing::FailingRng as core::default::Default>::default);
 }
 
-/// 47 addresses.
+/// 48 addresses.
 pub fn keep_fmt<P: wg::CryptoProvider, C: wg::ChaChaImpl, H: core::hash::Hasher>() {
     macro_rules! k {
         ($e:expr) => {
@@ -360,6 +365,7 @@ pub fn keep_fmt<P: wg::CryptoProvider, C: wg::ChaChaImpl, H: core::hash::Hasher>
     k!(<wg::Device<P> as core::fmt::Debug>::fmt);
     k!(<wg::Tunnel<P> as core::fmt::Debug>::fmt);
     k!(<wg::CookieChallenge as core::fmt::Debug>::fmt);
+    k!(<wg::CookieState as core::fmt::Debug>::fmt);
     k!(<wg::DeviceStats as core::fmt::Debug>::fmt);
     k!(<wg::DropReason as core::fmt::Debug>::fmt);
     k!(<wg::Encapsulated<'static> as core::fmt::Debug>::fmt);
