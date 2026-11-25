@@ -13,6 +13,7 @@
 //!   interop_conformance sink   <seconds> <bind-port>       <our-priv-b64> <kernel-pub-b64>
 //!   interop_conformance source <seconds> <kernel-endpoint> <our-priv-b64> <kernel-pub-b64>
 //!   interop_conformance crossed <bind-port> <kernel-endpoint> <our-priv-b64> <kernel-pub-b64>
+//!   interop_conformance crossed-either <bind-port> <peer-endpoint> <our-priv-b64> <peer-pub-b64>
 //!
 //! * `responder-cookie` answers the kernel's first initiation as if under
 //!   load, so the kernel has to complete the cookie dance.
@@ -27,6 +28,14 @@
 //!   drops its own; we answer the kernel's and keep ours, so our handshake
 //!   must complete with the kernel's answer — one round trip, nothing
 //!   retransmitted.
+//! * `crossed-either` is `crossed` against a peer that may keep either of
+//!   the two handshakes, or both, as wireguard-go does
+//!   (`scripts/interop_wireguard_go.sh`): it has several handshake
+//!   workers, and they take the two messages we send it at once. Which
+//!   handshake completed is therefore reported and not required. Required
+//!   is what does not depend on it: a session is there at once, nothing
+//!   was retransmitted, and the peer's pings are answered from the first
+//!   one on, none missing.
 
 #![allow(
     clippy::unwrap_used,
@@ -304,7 +313,7 @@ fn main() {
     // <bind-port>.
     let (seconds, bind_port, rest) = match role {
         "sink" | "source" => (args[2].parse::<u64>().expect("seconds"), "", &args[3..]),
-        "crossed" => (0, args[2].as_str(), &args[3..]),
+        "crossed" | "crossed-either" => (0, args[2].as_str(), &args[3..]),
         _ => (0, "", &args[2..]),
     };
     let target = rest[0].as_str();
@@ -321,10 +330,11 @@ fn main() {
         "responder-cookie" => run_responder(target, our_priv, peer_pub, psk, true),
         "sink" => run_sink(seconds, target, our_priv, peer_pub),
         "source" => run_source(seconds, target, our_priv, peer_pub),
-        "crossed" => run_crossed(bind_port, target, our_priv, peer_pub),
+        "crossed" => run_crossed(bind_port, target, our_priv, peer_pub, false),
+        "crossed-either" => run_crossed(bind_port, target, our_priv, peer_pub, true),
         _ => panic!(
             "usage: interop_conformance \
-             <initiator|responder|responder-cookie|sink|source|crossed> ..."
+             <initiator|responder|responder-cookie|sink|source|crossed|crossed-either> ..."
         ),
     }
 }
@@ -653,12 +663,15 @@ fn run_source(seconds: u64, endpoint: &str, our_priv: StaticSecret, peer_pub: Pu
 
 /// Both sides initiate at once (see the module docs). Passes if the
 /// crossing really happened, our own handshake completed with the
-/// kernel's answer, nothing was retransmitted, and traffic flows.
+/// kernel's answer, nothing was retransmitted, and traffic flows. With
+/// `either_handshake` (`crossed-either`) the handshake that completes may
+/// be the peer's as well, and no ping of the peer's may be missing.
 fn run_crossed(
     bind_port: &str,
     kernel_endpoint: &str,
     our_priv: StaticSecret,
     peer_pub: PublicKey,
+    either_handshake: bool,
 ) {
     let kernel: SocketAddr = kernel_endpoint.parse().expect("kernel endpoint");
     let mut ep = Endpoint::new(
@@ -697,6 +710,13 @@ fn run_crossed(
     let mut established_after: Option<Duration> = None;
     let mut completed_as_initiator = false;
     let mut echoes = 0usize;
+    // The ICMP sequence numbers of the echoes answered.
+    let mut echo_seqs = Vec::new();
+    // Our index of the session the peer's initiation made (the sender
+    // index of our answer), and whether the peer has sent on it: then
+    // the peer's handshake completed, whatever became of ours.
+    let mut their_session: Option<u32> = None;
+    let mut peer_sent_on_its_own = false;
     let mut rx = [0u8; 4096];
     let deadline = Instant::now() + Duration::from_secs(25);
     while Instant::now() < deadline && echoes < 3 {
@@ -704,6 +724,7 @@ fn run_crossed(
             continue;
         };
         let message_type = rx[0];
+        let receiver = u32::from_le_bytes([rx[4], rx[5], rx[6], rx[7]]);
         let mut out = [0u8; 128];
         enum Act {
             Reply(Vec<u8>, SocketAddr),
@@ -712,6 +733,11 @@ fn run_crossed(
         }
         let (act, established) = {
             let handled = ep.handle(src, false, &mut rx[..n], &mut out);
+            if matches!(handled.received, Received::Data(_) | Received::Keepalive)
+                && their_session == Some(receiver)
+            {
+                peer_sent_on_its_own = true;
+            }
             let act = match handled.received {
                 Received::HandshakeResponse(tx) => {
                     eprintln!("[+] answered the kernel's initiation");
@@ -748,11 +774,18 @@ fn run_crossed(
                 if !completed_as_initiator {
                     answered_theirs = true;
                 }
+                their_session = Some(u32::from_le_bytes([
+                    datagram[4],
+                    datagram[5],
+                    datagram[6],
+                    datagram[7],
+                ]));
                 ep.sock.send_to(&datagram, dst).unwrap();
             }
             Act::Echo(inner) => {
                 if ep.send(&inner) {
                     echoes += 1;
+                    echo_seqs.push(u16::from_be_bytes([inner[26], inner[27]]));
                 }
             }
             Act::Nothing => {}
@@ -770,9 +803,26 @@ fn run_crossed(
          echoes answered: {echoes}",
         s.handshakes_completed,
     );
-    // The kernel answers our initiation and drops its own, so the session
-    // is there one loopback round trip after the crossing.
+    // One loopback round trip after the crossing there is a session…
     let at_once = established_after.is_some_and(|d| d <= Duration::from_secs(1));
+    if either_handshake {
+        // …of either handshake, and no ping was lost on the way to it:
+        // the peer's end numbers its pings from 1
+        // (scripts/wg_netns_helper.py), and the first three were answered
+        // — the one that set the peer's handshake off among them.
+        eprintln!(
+            "[=] crossed-either: our handshake completed: {completed_as_initiator}; the \
+             peer's completed (it sent on the session of its own initiation): \
+             {peer_sent_on_its_own}; sequence numbers of the echoes answered: {echo_seqs:?}"
+        );
+        assert!(
+            answered_theirs && at_once && retransmits == 0 && echo_seqs == [1, 2, 3],
+            "FAIL: the crossed handshakes left no session at once, or one that lost a ping"
+        );
+        println!("CROSSED_PASS");
+        return;
+    }
+    // …of ours: the kernel answers our initiation and drops its own.
     assert!(
         answered_theirs
             && completed_as_initiator
