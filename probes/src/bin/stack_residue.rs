@@ -1024,7 +1024,11 @@ fn ciphers<C: ChaChaImpl>(scan: &mut Scan) {
     }
 
     // ---- the keystream ------------------------------------------------------------
-    for len in [37usize, 190, 600, 1000, 1420, 2048, 2300, 4133] {
+    // (The lengths: one, two and three pairs of blocks, which the AVX2
+    // backend has a kernel for; a stride and then one pair, three pairs,
+    // most of another stride; and several strides with tails of each
+    // kind.)
+    for len in [37usize, 190, 300, 600, 812, 1000, 1420, 2048, 2300, 4133] {
         paint();
         call_deep(|| C::apply_keystream(black_box(&key), &nonce, 1, &mut data[..len]));
         scan.take();
@@ -1033,8 +1037,10 @@ fn ciphers<C: ChaChaImpl>(scan: &mut Scan) {
     }
 
     // ---- the calls an AEAD makes ------------------------------------------------------
+    // (With block 0 in front: one pair, two, three; a stride and nothing
+    // after it; a stride and more.)
     add_block(&mut scan.needles, &key, 0, &nonce, "the one-time key's");
-    for len in [0usize, 32, 300, 1420, 3000] {
+    for len in [0usize, 32, 150, 300, 400, 1420, 3000] {
         paint();
         call_deep(|| C::seal_keystream(black_box(&key), &nonce, &mut data[..len], &mut otk));
         scan.take();

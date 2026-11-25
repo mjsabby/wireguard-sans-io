@@ -16,13 +16,36 @@
 //!
 //! Whole 512-byte strides are XORed into the buffer straight from the
 //! registers. What is left goes through one more stride, by way of a
-//! stack buffer that is wiped — unless it is at most two blocks (128
-//! bytes): for so little the scalar code is faster, and such tails are
-//! common (transport payloads are padded to 16 bytes, not to a stride; a
-//! small packet is nothing but tail).
+//! stack buffer that is wiped — unless it is at most six blocks (384
+//! bytes). Such tails are common (transport payloads are padded to 16
+//! bytes, not to a stride; a small packet is nothing but tail), and a
+//! stride is a poor way to make them: it costs what eight blocks cost.
+//!
+//! # Two blocks, four, six
+//!
+//! They have a kernel of their own ([`pairs`]), which is the other way
+//! of putting ChaCha20 into 256-bit registers: a register holds a *row*
+//! of the state — four words — of two blocks, one in each 128-bit half.
+//! The whole state of a pair of blocks is four registers, a quarter-round
+//! on registers is the four quarter-rounds of a round at once, and
+//! between the column round and the diagonal round the rows are rotated
+//! against each other. A round is then one chain of twelve operations
+//! where the scalar code has four of them to get through, and two blocks
+//! cost less than one does there: about 300 cycles against 400 apiece on
+//! the machine this was written on. That is the keystream of every packet
+//! of up to 64 bytes — an ACK, a keepalive, a DNS query — which is block
+//! 0 for the authenticator key and one block of stream; such a packet
+//! used to be two scalar blocks, three quarters of what sealing it cost.
+//!
+//! One chain leaves most of the core idle, so a second pair of blocks
+//! next to the first costs little, and a third little more: about 380
+//! cycles for four blocks and 440 for six, where a stride — eight — is
+//! 550. Up to six blocks are therefore pairs, and only more than that a
+//! stride. (Four pairs at once are no better than the stride: the state
+//! is then all sixteen registers.)
 //!
 //! For an AEAD, block 0 — the one-time authenticator key — is a block of
-//! the first stride ([`ChaChaImpl::seal_keystream`],
+//! the first stride, or of the first pair ([`ChaChaImpl::seal_keystream`],
 //! [`ChaChaImpl::open_keystream`]) instead of a scalar block of its own.
 //!
 //! # Which CPU
@@ -45,11 +68,13 @@
 //!
 //! Nothing that is the key or the keystream: the key words this module
 //! unpacks, the `c` words in memory and every stack buffer that held
-//! keystream are zeroed before a function returns — and so is the
+//! keystream are zeroed before a function returns — and so is a
 //! kernel's whole stack frame, where the compiler parks registers it has
 //! no room for (words of the key and of the keystream among them): its
 //! caller overwrites it after the last stride (`clear_frames`, see the
-//! crate documentation).
+//! crate documentation). The kernel for pairs reads the key from where
+//! the caller has it, straight into registers: there is no copy of it to
+//! zero.
 //!
 //! # Safety
 //!
@@ -58,8 +83,9 @@
 //!    AVX2 has been established as above — by `cfg` for the build, or by
 //!    the run-time check on the line before;
 //! 2. an unaligned load or store through a pointer into a `[u8; 512]`
-//!    that the function was handed by reference, at fixed offsets below
-//!    512;
+//!    (the kernel for pairs: an array of `[u8; 128]`s, and the
+//!    `[u8; 32]` of the key) that the function was handed by reference,
+//!    at fixed offsets inside it;
 //! 3. a volatile read or write of one of the four slots of a local
 //!    array.
 //!
@@ -74,19 +100,48 @@ use wireguard_sans_io::crypto::ct;
 
 use crate::{ChaChaImpl, SIGMA, Scalar, clear_frames, load_key_words, nonce_words, xor_tail};
 
-/// The longest tail that goes to the scalar code: two blocks. A stride
-/// costs about as much as two and a quarter scalar blocks whatever its
-/// width, so for one or two blocks — every small packet: a keepalive, an
-/// ACK, a DNS query — the scalar keystream is the faster one.
+/// The longest tail the AVX-512 module hands to the scalar code: two
+/// blocks. A stride costs about as much as two and a quarter scalar
+/// blocks whatever its width, so for one or two blocks — every small
+/// packet: a keepalive, an ACK, a DNS query — it is the wrong tool.
+/// (This module has [`pairs`] for them, and [`Detect`] sends what is
+/// small as a whole there on every CPU.)
+#[cfg(wg_avx512)]
 pub(crate) const SCALAR_TAIL_MAX: usize = 128;
 
 /// What one stride yields.
 const STRIDE: usize = 512;
 
+/// What a pair of blocks yields.
+const PAIR: usize = 128;
+
+/// The most that goes through [`pairs`] and not through a stride: three
+/// pairs, six blocks.
+const PAIRS_MAX: usize = 3 * PAIR;
+
+/// What one pair leaves for an AEAD's stream once block 0 has gone to
+/// the authenticator key: one block. A packet of up to this is the
+/// smallest there is to do, and what [`Detect`] always has done here.
+const PAIR_STREAM: usize = PAIR - 64;
+
+/// The same of three pairs: five blocks.
+const PAIRS_STREAM_MAX: usize = PAIRS_MAX - 64;
+
 /// What [`clear_frames`] overwrites at once after the kernel, in 64-bit
 /// words: its frame is about half a kilobyte in an optimised build (the
 /// four `c` rows and a dozen parked registers of thirty-two bytes).
 const KERNEL_FRAME: usize = 112;
+
+/// The same after [`pairs`] of one pair: four rows, their inputs and two
+/// masks are a dozen registers of sixteen, so in an optimised build
+/// nothing is parked and the frame is a few saved registers.
+#[cfg_attr(wg_low_opt, allow(dead_code))] // such a build does not size its clean-up
+const PAIR_FRAME: usize = 16;
+
+/// …and of two or three pairs: twelve rows are all the registers there
+/// are but four, and the counters and the masks want those.
+#[cfg_attr(wg_low_opt, allow(dead_code))]
+const PAIRS_FRAME: usize = 64;
 
 // ===========================================================================
 // The public types
@@ -101,6 +156,9 @@ pub struct Avx2x8;
 
 #[cfg(target_feature = "avx2")]
 impl ChaChaImpl for Avx2x8 {
+    /// One or two blocks are [`two_blocks`].
+    const SMALL_PACKETS: bool = true;
+
     #[inline]
     fn apply_keystream(key: &[u8; 32], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
         // SAFETY: this impl exists only where AVX2 is enabled for the
@@ -165,10 +223,16 @@ impl Detect {
 }
 
 impl ChaChaImpl for Detect {
+    /// One or two blocks are the AVX2 kernel for that on every CPU that
+    /// has AVX2 (and the scalar code's, as before, on one that has not).
+    const SMALL_PACKETS: bool = true;
+
     #[inline]
     fn apply_keystream(key: &[u8; 32], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
+        // (One or two blocks are the AVX2 pair kernel's on every CPU
+        // that has it, which is every CPU with AVX-512.)
         #[cfg(wg_avx512)]
-        if crate::avx512::available() {
+        if buf.len() > PAIR && crate::avx512::available() {
             // SAFETY: the CPU has AVX-512F — checked on the line above.
             unsafe { crate::avx512::apply(key, nonce, counter, buf) };
             return;
@@ -183,8 +247,9 @@ impl ChaChaImpl for Detect {
 
     #[inline]
     fn seal_keystream(key: &[u8; 32], nonce: &[u8; 12], buf: &mut [u8], otk: &mut [u8; 32]) {
+        // (As above: a small packet is block 0 and one block of stream.)
         #[cfg(wg_avx512)]
-        if crate::avx512::available() {
+        if buf.len() > PAIR_STREAM && crate::avx512::available() {
             // SAFETY: the CPU has AVX-512F — checked on the line above.
             unsafe { crate::avx512::seal(key, nonce, buf, otk) };
             return;
@@ -205,7 +270,7 @@ impl ChaChaImpl for Detect {
         verify: F,
     ) -> bool {
         #[cfg(wg_avx512)]
-        if crate::avx512::available() {
+        if buf.len() > PAIR_STREAM && crate::avx512::available() {
             // SAFETY: the CPU has AVX-512F — checked on the line above.
             return unsafe { crate::avx512::open(key, nonce, buf, verify) };
         }
@@ -239,9 +304,32 @@ impl ChaChaImpl for Detect {
 /// Caller must ensure the `avx2` target feature is available.
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn apply_8way(key: &[u8; 32], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
+    let nw = nonce_words(nonce);
+    if buf.len() <= PAIR {
+        // One or two blocks: the kernel for that, which reads the key
+        // where it is.
+        if !buf.is_empty() {
+            let mut ks = [[0u8; PAIR]; 1];
+            // SAFETY: AVX2 is available (this function's contract).
+            let low = unsafe { pairs(key, &nw, counter, &mut ks) };
+            clear_frames::<PAIR_FRAME>(low);
+            xor_tail(buf, ks.as_flattened());
+            ct::wipe(ks.as_flattened_mut());
+        }
+        return;
+    }
+    if buf.len() <= PAIRS_MAX {
+        // Up to six: the same, two or three pairs at a time.
+        let mut ks = [[0u8; PAIR]; 3];
+        // SAFETY: as above.
+        let low = unsafe { few_blocks(key, &nw, counter, buf.len(), &mut ks) };
+        clear_frames::<PAIRS_FRAME>(low);
+        xor_tail(buf, ks.as_flattened());
+        ct::wipe(ks.as_flattened_mut());
+        return;
+    }
     let mut kw = [0u32; 8];
     load_key_words(key, &mut kw);
-    let nw = nonce_words(nonce);
     let mut ctr = counter;
     // How far down the kernel's frame went (see `clear_frames`).
     let mut low = usize::MAX;
@@ -255,17 +343,57 @@ pub(crate) unsafe fn apply_8way(key: &[u8; 32], nonce: &[u8; 12], counter: u32, 
         ctr = ctr.wrapping_add(8);
     }
     let tail = chunks.into_remainder();
-    if tail.len() > SCALAR_TAIL_MAX {
+    if tail.len() > PAIRS_MAX {
         let mut ks = [0u8; STRIDE];
         // SAFETY: as above.
         low = low.min(unsafe { eight_blocks::<false>(&kw, &nw, ctr, &mut ks) });
         xor_tail(tail, &ks);
         ct::wipe_array(&mut ks);
+    } else if tail.len() > PAIR {
+        let mut ks = [[0u8; PAIR]; 3];
+        // SAFETY: as above.
+        low = low.min(unsafe { few_blocks(key, &nw, ctr, tail.len(), &mut ks) });
+        xor_tail(tail, ks.as_flattened());
+        ct::wipe(ks.as_flattened_mut());
     } else if !tail.is_empty() {
-        Scalar::apply_keystream(key, nonce, ctr, tail);
+        let mut ks = [[0u8; PAIR]; 1];
+        // SAFETY: as above.
+        low = low.min(unsafe { pairs(key, &nw, ctr, &mut ks) });
+        xor_tail(tail, ks.as_flattened());
+        ct::wipe(ks.as_flattened_mut());
     }
     ct::wipe_words(&mut kw);
     clear_frames::<KERNEL_FRAME>(low);
+}
+
+/// The keystream for `len` bytes — at most [`PAIRS_MAX`] — from block
+/// `ctr` on, at the start of `ks`: one, two or three pairs of blocks, as
+/// many as it takes. Returns what [`pairs`] returns.
+///
+/// # Safety
+/// Caller must ensure the `avx2` target feature is available.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn few_blocks(
+    key: &[u8; 32],
+    nonce: &[u32; 3],
+    ctr: u32,
+    len: usize,
+    ks: &mut [[u8; PAIR]; 3],
+) -> usize {
+    if len <= PAIR {
+        if let Some(one) = ks.first_chunk_mut::<1>() {
+            // SAFETY: AVX2 is available (this function's contract).
+            return unsafe { pairs(key, nonce, ctr, one) };
+        }
+    } else if len <= 2 * PAIR {
+        if let Some(two) = ks.first_chunk_mut::<2>() {
+            // SAFETY: as above.
+            return unsafe { pairs(key, nonce, ctr, two) };
+        }
+    }
+    // SAFETY: as above.
+    unsafe { pairs(key, nonce, ctr, ks) }
 }
 
 /// For an AEAD seal: the first half of block 0 to `otk`, blocks 1
@@ -281,14 +409,35 @@ pub(crate) unsafe fn seal_8way(
     buf: &mut [u8],
     otk: &mut [u8; 32],
 ) {
-    if buf.len() <= 64 {
-        // Two blocks in all: the scalar code is faster.
-        Scalar::seal_keystream(key, nonce, buf, otk);
+    let nw = nonce_words(nonce);
+    if buf.len() <= PAIR_STREAM {
+        // Two blocks in all: block 0 and the stream's one, as a pair.
+        let mut ks = [[0u8; PAIR]; 1];
+        // SAFETY: AVX2 is available (this function's contract).
+        let low = unsafe { pairs(key, &nw, 0, &mut ks) };
+        clear_frames::<PAIR_FRAME>(low);
+        for (d, s) in otk.iter_mut().zip(ks.as_flattened()) {
+            *d = *s;
+        }
+        xor_tail(buf, ks.as_flattened().get(64..).unwrap_or(&[]));
+        ct::wipe(ks.as_flattened_mut());
+        return;
+    }
+    if buf.len() <= PAIRS_STREAM_MAX {
+        // Up to six blocks in all: two or three pairs.
+        let mut ks = [[0u8; PAIR]; 3];
+        // SAFETY: as above.
+        let low = unsafe { few_blocks(key, &nw, 0, buf.len().saturating_add(64), &mut ks) };
+        clear_frames::<PAIRS_FRAME>(low);
+        for (d, s) in otk.iter_mut().zip(ks.as_flattened()) {
+            *d = *s;
+        }
+        xor_tail(buf, ks.as_flattened().get(64..).unwrap_or(&[]));
+        ct::wipe(ks.as_flattened_mut());
         return;
     }
     let mut kw = [0u32; 8];
     load_key_words(key, &mut kw);
-    let nw = nonce_words(nonce);
     let mut ks = [0u8; STRIDE];
     // SAFETY: AVX2 is available (this function's contract).
     let low = unsafe { eight_blocks::<false>(&kw, &nw, 0, &mut ks) };
@@ -320,12 +469,42 @@ pub(crate) unsafe fn open_8way<F: FnOnce(&[u8; 32], &[u8]) -> bool>(
     buf: &mut [u8],
     verify: F,
 ) -> bool {
-    if buf.len() <= 64 {
-        return Scalar::open_keystream(key, nonce, buf, verify);
+    let nw = nonce_words(nonce);
+    if buf.len() <= PAIR_STREAM {
+        // As in `seal_8way`: one pair. Both blocks are made before the
+        // verdict — which is still less than the scalar code's one.
+        let mut ks = [[0u8; PAIR]; 1];
+        // SAFETY: AVX2 is available (this function's contract).
+        let low = unsafe { pairs(key, &nw, 0, &mut ks) };
+        clear_frames::<PAIR_FRAME>(low);
+        let ok = match ks.as_flattened().first_chunk::<32>() {
+            Some(otk) => verify(otk, buf),
+            None => false,
+        };
+        if ok {
+            xor_tail(buf, ks.as_flattened().get(64..).unwrap_or(&[]));
+        }
+        ct::wipe(ks.as_flattened_mut());
+        return ok;
+    }
+    if buf.len() <= PAIRS_STREAM_MAX {
+        // …or two or three.
+        let mut ks = [[0u8; PAIR]; 3];
+        // SAFETY: as above.
+        let low = unsafe { few_blocks(key, &nw, 0, buf.len().saturating_add(64), &mut ks) };
+        clear_frames::<PAIRS_FRAME>(low);
+        let ok = match ks.as_flattened().first_chunk::<32>() {
+            Some(otk) => verify(otk, buf),
+            None => false,
+        };
+        if ok {
+            xor_tail(buf, ks.as_flattened().get(64..).unwrap_or(&[]));
+        }
+        ct::wipe(ks.as_flattened_mut());
+        return ok;
     }
     let mut kw = [0u32; 8];
     load_key_words(key, &mut kw);
-    let nw = nonce_words(nonce);
     let mut ks = [0u8; STRIDE];
     // SAFETY: AVX2 is available (this function's contract).
     let low = unsafe { eight_blocks::<false>(&kw, &nw, 0, &mut ks) };
@@ -542,6 +721,161 @@ unsafe fn eight_blocks<const XOR: bool>(
     low
 }
 
+/// `N` pairs of keystream blocks, from block `ctr` on, written to `out`:
+/// the other layout (see the module documentation). Each register is a
+/// row of the state of one pair, the even block in its low half and the
+/// odd one in its high half; the diagonal round is the column round on
+/// rows that have been rotated against each other. The pairs are
+/// independent of each other and go through the rounds side by side.
+///
+/// The key is read from `key` into registers — once for the state and
+/// once for the feed-forward — and is nowhere else. Returns where the
+/// stack ends beneath this function's frame, as [`eight_blocks`] does
+/// and for the same reason; never inlined, for the same reason too.
+///
+/// # Safety
+/// Caller must ensure the `avx2` target feature is available.
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+#[allow(clippy::multiple_unsafe_ops_per_block, clippy::indexing_slicing)] // every line is an intrinsic; indices below N, from loops over 0..N
+unsafe fn pairs<const N: usize>(
+    key: &[u8; 32],
+    nonce: &[u32; 3],
+    ctr: u32,
+    out: &mut [[u8; PAIR]; N],
+) -> usize {
+    // Taken before anything is in a vector register: a call in the
+    // middle would have all of them saved around it.
+    let low = ct::stack_mark();
+    // SAFETY: every intrinsic is gated by `target_feature(avx2)`; the
+    // loads through `kp` are 16 bytes at offsets 0 and 16 of the 32-byte
+    // array `key`; the stores through a `block` pointer are 32 bytes at
+    // offsets 0, 32, 64 and 96 of one of the 128-byte arrays of `out`.
+    unsafe {
+        // pshufb masks, broadcast across both 128-bit halves.
+        let rol16 = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6, 1, 0, 3, 2,
+        ));
+        let rol8 = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            14, 13, 12, 15, 10, 9, 8, 11, 6, 5, 4, 7, 2, 1, 0, 3,
+        ));
+        let [s0, s1, s2, s3] = SIGMA.map(|word| word as i32);
+        let [n0, n1, n2] = nonce.map(|word| word as i32);
+        let kp = key.as_ptr();
+        let sigma = _mm256_setr_epi32(s0, s1, s2, s3, s0, s1, s2, s3);
+        // Pair i is blocks `ctr + 2 i` (low half) and `ctr + 2 i + 1`
+        // (high half), wrapping, per RFC 8439.
+        let mut d0 = [sigma; N];
+        let mut first = ctr;
+        for row in &mut d0 {
+            *row = _mm256_setr_epi32(
+                first as i32,
+                n0,
+                n1,
+                n2,
+                first.wrapping_add(1) as i32,
+                n0,
+                n1,
+                n2,
+            );
+            first = first.wrapping_add(2);
+        }
+        let mut a = [sigma; N];
+        let mut b = [_mm256_broadcastsi128_si256(_mm_loadu_si128(kp.cast())); N];
+        let mut c = [_mm256_broadcastsi128_si256(_mm_loadu_si128(kp.add(16).cast())); N];
+        let mut d = d0;
+        // One step for every pair before the next step for any: the
+        // pairs' chains then run next to each other.
+        macro_rules! each {
+            ($row:ident = $op:ident($($arg:tt)*)) => {
+                for i in 0..N {
+                    $row[i] = $op!(i, $($arg)*);
+                }
+            };
+        }
+        macro_rules! add {
+            ($i:ident, $x:ident, $y:ident) => {
+                _mm256_add_epi32($x[$i], $y[$i])
+            };
+        }
+        macro_rules! xor {
+            ($i:ident, $x:ident, $y:ident) => {
+                _mm256_xor_si256($x[$i], $y[$i])
+            };
+        }
+        macro_rules! xor_rol {
+            ($i:ident, $x:ident, $y:ident, $mask:ident) => {
+                _mm256_shuffle_epi8(_mm256_xor_si256($x[$i], $y[$i]), $mask)
+            };
+        }
+        macro_rules! rol {
+            ($i:ident, $x:ident, $left:literal, $right:literal) => {
+                _mm256_or_si256(
+                    _mm256_slli_epi32($x[$i], $left),
+                    _mm256_srli_epi32($x[$i], $right),
+                )
+            };
+        }
+        // The four quarter-rounds of a round, on whole rows.
+        macro_rules! round {
+            () => {
+                each!(a = add(a, b));
+                each!(d = xor_rol(d, a, rol16));
+                each!(c = add(c, d));
+                each!(b = xor(b, c));
+                each!(b = rol(b, 12, 20));
+                each!(a = add(a, b));
+                each!(d = xor_rol(d, a, rol8));
+                each!(c = add(c, d));
+                each!(b = xor(b, c));
+                each!(b = rol(b, 7, 25));
+            };
+        }
+        for _ in 0..10 {
+            // Columns.
+            round!();
+            // Diagonals: the rows are rotated against each other — and
+            // back afterwards. Against row b, which stays where it is:
+            // b is the last a round computes and the first thing the next
+            // one needs, so a shuffle of b would be one more link in the
+            // chain, while the others have time to spare. (Word i of b
+            // meets word i - 1 of a, i + 1 of c and i + 2 of d.)
+            for ((a, c), d) in a.iter_mut().zip(c.iter_mut()).zip(d.iter_mut()) {
+                *a = _mm256_shuffle_epi32(*a, 0b10_01_00_11);
+                *c = _mm256_shuffle_epi32(*c, 0b00_11_10_01);
+                *d = _mm256_shuffle_epi32(*d, 0b01_00_11_10);
+            }
+            round!();
+            for ((a, c), d) in a.iter_mut().zip(c.iter_mut()).zip(d.iter_mut()) {
+                *a = _mm256_shuffle_epi32(*a, 0b00_11_10_01);
+                *c = _mm256_shuffle_epi32(*c, 0b10_01_00_11);
+                *d = _mm256_shuffle_epi32(*d, 0b01_00_11_10);
+            }
+        }
+        // Feed-forward, the key from where it was read before (it was
+        // not kept in registers across the rounds), and out: a block is
+        // the low halves of the four rows, in order; the next one the
+        // high halves.
+        let kb = _mm256_broadcastsi128_si256(_mm_loadu_si128(kp.cast()));
+        let kc = _mm256_broadcastsi128_si256(_mm_loadu_si128(kp.add(16).cast()));
+        for (block, (a, (b, (c, (d, d0))))) in out.iter_mut().zip(
+            a.iter()
+                .zip(b.iter().zip(c.iter().zip(d.iter().zip(d0.iter())))),
+        ) {
+            let a = _mm256_add_epi32(*a, sigma);
+            let b = _mm256_add_epi32(*b, kb);
+            let c = _mm256_add_epi32(*c, kc);
+            let d = _mm256_add_epi32(*d, *d0);
+            let p = block.as_mut_ptr();
+            _mm256_storeu_si256(p.cast(), _mm256_permute2x128_si256(a, b, 0x20));
+            _mm256_storeu_si256(p.add(32).cast(), _mm256_permute2x128_si256(c, d, 0x20));
+            _mm256_storeu_si256(p.add(64).cast(), _mm256_permute2x128_si256(a, b, 0x31));
+            _mm256_storeu_si256(p.add(96).cast(), _mm256_permute2x128_si256(c, d, 0x31));
+        }
+    }
+    low
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,5 +915,72 @@ mod tests {
             return;
         }
         crate::check::all::<Avx2Tier>();
+    }
+
+    /// The kernel for pairs by itself: its blocks are the scalar code's
+    /// blocks `ctr`, `ctr + 1`, … — for one, two and three pairs, for the
+    /// counters that matter (the first, the last, where a block's number
+    /// wraps inside a pair and between two) and for keys and nonces with
+    /// every bit of every word in play.
+    #[test]
+    fn the_pair_kernel_makes_scalar_blocks() {
+        use wireguard_sans_io::crypto::chacha20::block;
+        if !Detect::avx2_available() {
+            eprintln!("skipped: this CPU has no AVX2");
+            return;
+        }
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 56) as u8
+        };
+        let mut keys: Vec<([u8; 32], [u8; 12])> = vec![
+            ([0u8; 32], [0u8; 12]),
+            ([0xff; 32], [0xff; 12]),
+            (
+                crate::check::rfc_key(),
+                [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0],
+            ),
+        ];
+        for _ in 0..200 {
+            let mut key = [0u8; 32];
+            key.iter_mut().for_each(|b| *b = next());
+            let mut nonce = [0u8; 12];
+            nonce.iter_mut().for_each(|b| *b = next());
+            keys.push((key, nonce));
+        }
+        fn check<const N: usize>(key: &[u8; 32], nonce: &[u8; 12], ctr: u32) {
+            let mut out = [[0xa5u8; PAIR]; N];
+            // SAFETY: the CPU has AVX2 — the caller has checked.
+            let low = unsafe { pairs(key, &nonce_words(nonce), ctr, &mut out) };
+            clear_frames::<PAIRS_FRAME>(low);
+            for (i, made) in out.as_flattened().chunks_exact(64).enumerate() {
+                assert!(
+                    made == &block(key, ctr.wrapping_add(i as u32), nonce)[..],
+                    "{N} pairs from block {ctr}: block {i}"
+                );
+            }
+        }
+        for (key, nonce) in &keys {
+            for ctr in [
+                0,
+                1,
+                2,
+                0x7fff_ffff,
+                0x8000_0000,
+                u32::MAX - 5,
+                u32::MAX - 4,
+                u32::MAX - 3,
+                u32::MAX - 2,
+                u32::MAX - 1,
+                u32::MAX,
+            ] {
+                check::<1>(key, nonce, ctr);
+                check::<2>(key, nonce, ctr);
+                check::<3>(key, nonce, ctr);
+            }
+        }
     }
 }

@@ -245,6 +245,20 @@ fn xor_blocks(state: &mut [u32; 16], ks: &mut [u8; 64], data: &mut [u8]) {
 /// test suite enforces this against [`Scalar`] across all tail-boundary
 /// lengths.
 pub trait ChaChaImpl: Send + Sync + 'static {
+    /// Does this backend want the small packets as well?
+    ///
+    /// [`crate::InTree`] seals and opens transport packets of up to
+    /// [`crate::InTree::SCALAR_BELOW`] bytes with the scalar keystream
+    /// unless this says `true`. Such a packet is two blocks of keystream
+    /// — block 0 for the authenticator key and one of stream — and a
+    /// backend that only has strides of four blocks or more is slower at
+    /// that than the scalar code. One with a kernel for a block or two is
+    /// not, and says so here.
+    ///
+    /// The handshake's AEADs are the scalar keystream's whatever this
+    /// says.
+    const SMALL_PACKETS: bool = false;
+
     /// XOR the RFC 8439 keystream into `buf` in place.
     fn apply_keystream(key: &[u8; 32], nonce: &[u8; 12], counter: u32, buf: &mut [u8]);
 

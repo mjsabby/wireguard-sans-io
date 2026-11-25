@@ -3,8 +3,8 @@
 //! | backend | blocks per stride | where |
 //! |---|---|---|
 //! | [`Scalar`] | 1 | everywhere: re-export of the core's safe oracle |
-//! | [`Avx2x8`] | 8 | x86_64 builds with AVX2 enabled for the whole program |
-//! | [`Detect`] | 32, 8 or 1 | x86_64, any build: the AVX-512 kernels, the AVX2 kernel or `Scalar`, as the CPU allows |
+//! | [`Avx2x8`] | 8; pairs of blocks for up to six | x86_64 builds with AVX2 enabled for the whole program |
+//! | [`Detect`] | 32, 8 or 1; pairs for what is small | x86_64, any build: the AVX-512 kernels, the AVX2 kernels or `Scalar`, as the CPU allows |
 //! | [`Neon`] | 4 | aarch64 |
 //! | [`Best`] | — | see below |
 //!
@@ -22,6 +22,10 @@
 //!   to build, and a CPU from the generations that keep their clock for
 //!   512-bit code), AVX2, or the scalar code. A check costs a cached flag
 //!   per call; there is none for a feature the build already requires.
+//!   What is small — a packet of up to 64 bytes, which is two blocks of
+//!   keystream with the authenticator key's — is the AVX2 kernel for
+//!   pairs of blocks on every CPU that has AVX2, AVX-512 or not: the
+//!   wide kernels have nothing to offer two blocks.
 //! * `aarch64`: [`Neon`]; NEON is part of the architecture baseline.
 //! * anything else: [`Scalar`].
 //!
