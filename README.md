@@ -66,7 +66,7 @@ Complete runnable examples live in the `Tunnel` rustdoc (two peers) and the
 
 | | owns | calls |
 |---|---|---|
-| `Device` | one local identity: the static key, the `mac1`/cookie state keyed by it, the key that makes session indices routable | `receive` + `identify` (several peers) or `receive_for` (one peer); `cookie_reply`; `tunnel` |
+| `Device` | one local identity: the static key, the `mac1`/cookie state keyed by it, the key that makes session indices routable | `receive` + `identify` (several peers) — `receive_shared` when several threads receive on it — or `receive_for` (one peer); `cookie_reply` / `cookie_reply_shared`; `tunnel` |
 | `Tunnel` | one peer: handshake, sessions, endpoint, timers | `encapsulate`; `handle` / `handle_initiation`; `poll`; `next_wake` |
 
 A `Tunnel` does not borrow its `Device`: store tunnels wherever you like
@@ -156,11 +156,25 @@ tunnel for that key does the rest (two more X25519 and a key generation,
 but only for an initiation that has authenticated). `tests/cost.rs` pins
 those numbers with a counting crypto provider.
 
-`Device::receive` takes `&mut self` and is cheap; `Device::identify` takes
-`&self`. What both return borrows only the datagram. With several receive
-threads, hold the device's lock for `receive` and share it for `identify`,
-then call into the tunnel under the tunnel's own lock: the expensive work
-then runs in parallel.
+With several receive threads, share the device by reference — an
+`Arc<Device>`, no lock — and call `Device::receive_shared` instead of
+`receive`: it takes `&self`, as `Device::identify` does, and is handed
+what changes while a device receives. That is two things: counters (a
+`DeviceStats` per thread) and the cookie secret (one `CookieState`, behind
+a lock of its own, which only handshake messages that arrive under load
+ask for — shared to check a cookie, exclusively for
+`Device::cookie_reply_shared`). Each tunnel is called under its own lock.
+Nothing then stands between a datagram and its tunnel: not another
+thread's `receive`, and not the X25519 of an initiation another thread is
+identifying. (`Device::receive` and `Device::cookie_reply` take `&mut
+self` and keep both inside the device: the calls for one thread. Behind a
+lock they put every datagram of every peer in one queue — and a
+reader-writer lock held *shared* across `identify` keeps `receive`, a
+writer, out for as long: measured, one thread fed forged initiations
+took four threads' routing from 7.4 million packets a second to under
+600. `audit/src/bin/lock_scaling.rs` is that measurement, for all three
+arrangements; `tests/shared_device.rs` holds the shared calls to saying
+and costing exactly what the others do.)
 
 ### Session indices: routing without a table
 
@@ -241,8 +255,10 @@ order matters:
    completing by racing forged cookie replies, since the key those are
    sealed with derives from a public key. So: the time spent on
    handshake messages that passed `mac1` (`wireguard-embed`: more than a
-   tenth of a second in one second), or the depth of the queue they wait
-   in (the kernel's choice: 512 of them). A count of messages per second
+   tenth of the time, by a budget that fills at a tenth of a second per
+   second and holds ten milliseconds; once over, for a second at the
+   least), or the depth of the queue they wait in (the kernel's choice:
+   512 of them). A count of messages per second
    works too if the threshold is far above what the peers themselves
    send; BoringTun's ten a second is what anyone who knows the public
    key can send.
@@ -494,9 +510,10 @@ Where the whitepaper leaves a choice, this is what the implementation does.
 
 | | |
 |---|---|
-| `embed/` — `wireguard-embed` | `std` driver with BoringTun-style ergonomics: `Tunn` (a clock that counts time spent suspended, OS entropy, load signal and per-source handshake limit, packet queue, buffer pool, tunnel MTU) and, behind the `async` feature, a tokio event loop (`AsyncTunn`) that no datagram, ICMP error, slow reader or slow link can stop — or stop listening. Uses the SIMD keystream. Its dependencies: `getrandom`; on Linux and Android `rustix` (the boot-time clock, and the socket's error queue); `tokio` with `async`. |
+| `embed/` — `wireguard-embed` | `std` driver with BoringTun-style ergonomics: `Tunn` (a clock that counts time spent suspended, OS entropy, load signal and per-source handshake limit, packet queue, buffer pool, tunnel MTU) and, behind the `async` feature, a tokio event loop (`AsyncTunn`) that no datagram, ICMP error, slow reader or slow link can stop — or stop listening — and that serves the session's packets before anyone's handshake messages, so that a flood of those costs handshakes and not traffic. Uses the SIMD keystream. Its dependencies: `getrandom`; on Linux and Android `rustix` (the boot-time clock, and the socket's error queue); `tokio` with `async`. |
 | `simd/` — `wireguard-chacha-simd` | AVX-512 / AVX2 / NEON ChaCha20 keystreams; the only `unsafe` in the library crates. A kernel's stack frame — where a compiler parks the registers it has no room for, key words among them — is overwritten after the last stride. |
 | `bench/` | Criterion comparison against BoringTun and a UDP throughput harness (its own workspace; see `bench/README.md`). |
+| `audit/` | What an adversarial review measured, kept runnable (its own workspace; see `audit/README.md`): every primitive against an independent implementation and the Wycheproof vectors, what each kind of datagram costs its receiver in hardware counters, the receive path with more peers than fit the cache, and a flood rig for the event loop. |
 | `fuzz/` | Six libFuzzer targets, with a small checked-in seed corpus each. The handshake targets predict the outcome of every input independently and compare; the session target checks, among other things, that no datagram is ever accepted twice. |
 | `probes/` | Checks that have to look at memory or at linked machine code, which the core — `unsafe` forbidden for all its targets — cannot host: the stack and memory residue probes for the core and the driver, the program whose basic blocks are counted, and the freestanding image behind the panic and `no_std` checks. |
 
@@ -505,6 +522,12 @@ Where the whitepaper leaves a choice, this is what the implementation does.
 ```sh
 cargo test                                               # core: unit, integration and doc tests
 cargo test -p wireguard-embed --features async           # std driver and tokio loop
+cargo test --release -p wireguard-embed --features async --test flood -- --ignored --nocapture   # a flood at a tunnel that is up (eight idle cores)
+cargo test --release -p wireguard-embed --test hostile_network -- --ignored  # two tunnels on a hostile network, the long run
+cargo test --release --test shared_device -- --ignored --nocapture           # one device on several threads, timed
+(cd audit && cargo test)                                 # the primitives against RustCrypto, dalek and Wycheproof
+scripts/perf_attack_cost.sh                              # what each kind of datagram costs its receiver (perf counters)
+scripts/flood_rig.sh init 4 100000                       # server, peer and attacker as three processes
 cargo test -p wireguard-chacha-simd                      # SIMD keystreams against the scalar one
 scripts/check_no_panic.sh                                # no panic machinery in the optimised image
 scripts/check_no_std.sh                                  # links without std and without an allocator
@@ -515,10 +538,12 @@ cargo test --release --test constant_time -- --ignored   # timing tripwires, on 
 scripts/driver_netns_tests.sh                            # forged ICMP against the event loop; no root needed
 scripts/fuzz_all.sh 120                                  # 6 × 120 s guided fuzz (nightly, cargo-fuzz)
 scripts/interop_netns.sh                                 # against the Linux kernel; no root needed
+scripts/build_wireguard_go.sh && scripts/interop_wireguard_go.sh   # against wireguard-go (needs a Go toolchain); no root needed
 scripts/interop_wg_tool.sh 64                            # against wireguard-tools
 scripts/coverage.sh                                      # coverage table; fails below 94 % of the library's lines
 cargo run --release --example perf                       # benchmarks: the core
 (cd bench && cargo bench)                                # benchmarks: the driver, against BoringTun
+scripts/perf_vs_kernel.sh                                # the driver's data path next to the kernel's and wireguard-go's
 ```
 
 No test in the default suite depends on how long something takes. What
@@ -553,6 +578,23 @@ implementation has to satisfy the dead-peer timer of the sending one: a
 keepalive every ten seconds, and no new handshake. (Rekeying — two minutes
 into a session — is not in these runs.) A scenario that fails is reported
 and the others still run. The same script is what CI runs.
+
+`scripts/interop_wireguard_go.sh` runs the same eight scenarios against
+wireguard-go, the reference userspace implementation, which
+`scripts/build_wireguard_go.sh` builds from source at a pinned commit —
+and asks for more than the kernel script does: what went into one end
+has to have come out of the other (echo replies counted at wireguard-go's
+interface, datagrams sent and received compared). One scenario is not
+the kernel's: when both ends initiate at once the kernel always answers
+our initiation and drops its own, while wireguard-go, with a handshake
+worker per CPU, keeps either handshake or both — so there the script
+requires what does not depend on which: a session at once, nothing
+retransmitted, and no ping lost. (About one such run in forty on a
+small machine meets a race in wireguard-go 0.0.20250522 itself — it
+begins a session under an index it has just deleted, and hears nothing
+on it for fifteen seconds. Its own log shows when; the script then
+counts the run neither way and repeats the scenario, and says so. Our
+side's own checks are never excused.)
 
 ## Performance
 
@@ -589,7 +631,11 @@ protocol code with an AVX-512, AVX2 or NEON keystream, plus what a driver
 adds per packet) is measured separately, next to BoringTun, in `bench/` —
 a change to the driver's receive path does not show here. There, on this
 machine, a 1420-byte packet takes 0.46 µs to encapsulate (a sixth less
-than BoringTun) and a 64-byte one 0.16 µs (the same).
+than BoringTun) and a 64-byte one 0.16 µs (the same). That is with an
+AVX-512 keystream; on a CPU that has AVX2 and no more, BoringTun is the
+faster one for packets of a few hundred bytes and more, by a third,
+and small packets are level — `bench/README.md` has both machines, and
+the driver next to the Linux kernel's implementation and wireguard-go.
 
 For profiling: `cargo build --profile profiling --example perf`, then
 `perf record --call-graph dwarf -- target/profiling/examples/perf`.
@@ -641,14 +687,16 @@ material is at any moment is part of the design:
   as found; so do two words of a cipher key or state, and any one word
   that a hash's working vector held inside its rounds). The second reads
   a tunnel's own bytes at each stage of its life: it holds exactly the
-  secrets that stage needs, and nothing once dropped. The third does what
+  secrets that stage needs, and nothing once dropped — nor does a device
+  that has minted cookies, nor the `CookieState` a caller keeps for a
+  device that several threads receive on. The third does what
   the first does for `wireguard-embed`'s constructors. All of them first
   prove they can see what they look for, and that the stack scrub leaves
   no byte of its range as it was.
 * **Each wipe is there for something that can be seen.**
   `scripts/check_wipes_matter.py` removes the wipes one at a time and runs
-  the probes: of 154 statements that zero key material or overwrite a
-  frame, the removal of any one of 100 makes the check fail. The other
+  the probes: of 168 statements that zero key material or overwrite a
+  frame, the removal of any one of 114 makes the check fail. The other
   54 are listed in the script, each with its reason: 30 are second lines
   of defence (a buffer zeroed inside a frame that is overwritten as a
   whole anyway, a slot wiped again before it is filled), 12 are on paths
