@@ -4,11 +4,12 @@
 //!
 //! Two modes:
 //!
-//! * `udp_throughput pump <endpoint> <our_priv_b64> <peer_pub_b64> <secs>`
+//! * `udp_throughput pump <endpoint> <our_priv_b64> <peer_pub_b64> <secs> [window]`
 //!     — initiator: handshakes with `<endpoint>`, then sends 1420-byte
 //!     IPv4 packets for `<secs>` seconds, as fast as their echoes come
-//!     back (a window of them in flight), and reports MB/s + pps based on
-//!     decrypted echoes received back, and how many were not echoed.
+//!     back (a window of them in flight: 64, or `[window]`), and reports
+//!     MB/s + pps based on decrypted echoes received back, and how many
+//!     were not echoed.
 //!
 //! * `udp_throughput echo <listen_port> <our_priv_b64> <peer_pub_b64>`
 //!     — responder: listens, handshakes, decrypts every transport packet
@@ -35,6 +36,11 @@
 //! # set up wg0 via `ip link add ... type wireguard`, same as above.
 //! ```
 //!
+//! `scripts/perf_vs_kernel.sh` does all three, in a network namespace
+//! of its own, with IP forwarding as the echo: an interface whose route
+//! for the pump's addresses is itself sends what it decrypts straight
+//! back to the peer it came from.
+//!
 //! All three then carry identical UDP/syscall overhead, so the numbers
 //! are comparable.
 
@@ -56,7 +62,7 @@ fn main() {
         Some("echo") => echo(&args[2..]),
         _ => {
             eprintln!(
-                "usage:\n  {0} pump <endpoint> <priv_b64> <peer_pub_b64> <secs>\n  {0} echo <port> <priv_b64> <peer_pub_b64>",
+                "usage:\n  {0} pump <endpoint> <priv_b64> <peer_pub_b64> <secs> [window]\n  {0} echo <port> <priv_b64> <peer_pub_b64>",
                 args.first().map(String::as_str).unwrap_or("udp_throughput")
             );
             std::process::exit(2);
@@ -83,25 +89,42 @@ fn b64(s: &str) -> [u8; 32] {
     out.try_into().expect("32-byte key")
 }
 
+/// The packet the pump sends: an IPv4 header a router accepts — the
+/// kernel's WireGuard hands what it decrypts to the kernel's IP stack,
+/// which forwards nothing with a wrong header checksum — from 10.9.0.2 to
+/// 10.9.0.1, and a payload that is no protocol's. (Protocol 253 is one of
+/// the two numbers reserved for experiments: nothing along the way has
+/// an opinion about its contents.)
 fn make_packet() -> Vec<u8> {
     let mut p = vec![0u8; PKT_LEN];
     p[0] = 0x45;
     p[2..4].copy_from_slice(&(PKT_LEN as u16).to_be_bytes());
     p[8] = 64;
-    p[9] = 17; // UDP
+    p[9] = 253;
     p[12..16].copy_from_slice(&[10, 9, 0, 2]);
     p[16..20].copy_from_slice(&[10, 9, 0, 1]);
+    let sum: u32 = p[..20]
+        .chunks_exact(2)
+        .map(|pair| u32::from(u16::from_be_bytes([pair[0], pair[1]])))
+        .sum();
+    let folded = (sum & 0xffff) + (sum >> 16);
+    let checksum = !((folded & 0xffff) + (folded >> 16)) as u16;
+    p[10..12].copy_from_slice(&checksum.to_be_bytes());
     for (i, b) in p[20..].iter_mut().enumerate() {
         *b = i as u8;
     }
     p
 }
 
+/// How many packets the pump keeps in flight unless told otherwise.
+const WINDOW: u64 = 64;
+
 fn pump(args: &[String]) {
     let endpoint: SocketAddr = args[0].parse().expect("endpoint");
     let priv_key = StaticSecret::from_bytes(b64(&args[1]));
     let peer_pub = PublicKey::from_bytes(b64(&args[2]));
     let secs: u64 = args[3].parse().expect("secs");
+    let window: u64 = args.get(4).map_or(WINDOW, |w| w.parse().expect("window"));
 
     let mut tunn = Tunn::new(priv_key, peer_pub, None, None, Some(endpoint), None).unwrap();
     // The socket is connected: it can only hear from, and send to,
@@ -151,7 +174,13 @@ fn pump(args: &[String]) {
     // echoed, for ever: each loss made it one smaller — which is how it
     // came down to a size that worked — after 256 losses the pump
     // stopped, and the figure it printed depended on how long it had run.)
-    const WINDOW: u64 = 64;
+    //
+    // How many datagrams fit depends on who sent them: the buffer is
+    // charged with the memory a datagram's buffer holds, not with its
+    // length, and one the kernel's WireGuard has forwarded holds about
+    // twice what one from a `send` call does. Hence the argument: 32
+    // against the kernel (`scripts/perf_vs_kernel.sh` uses that for
+    // every peer, so that they are compared at the same window).
     const STALL: Duration = Duration::from_millis(20);
     let mut packet = make_packet();
     let (mut sent, mut recvd, mut bytes_rx) = (0u64, 0u64, 0u64);
@@ -162,7 +191,7 @@ fn pump(args: &[String]) {
     let mut last_echo = Instant::now();
     let until = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < until {
-        while sent.saturating_sub(recvd + lost) < WINDOW {
+        while sent.saturating_sub(recvd + lost) < window {
             packet[SEQ].copy_from_slice(&sent.to_le_bytes());
             match tunn.encapsulate(&packet, &mut tx) {
                 TunnResult::WriteToNetwork(w, _) => {
@@ -202,7 +231,7 @@ fn pump(args: &[String]) {
                 _ => {}
             }
         }
-        if sent.saturating_sub(recvd + lost) >= WINDOW && last_echo.elapsed() >= STALL {
+        if sent.saturating_sub(recvd + lost) >= window && last_echo.elapsed() >= STALL {
             lost = sent.saturating_sub(recvd);
             expected = sent;
             stalls += 1;
